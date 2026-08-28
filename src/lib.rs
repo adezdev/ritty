@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::iter::once;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A positional argument in a Ritty command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1093,6 +1093,24 @@ impl std::fmt::Debug for LifecycleHook {
     }
 }
 
+type LoaderFn = dyn Fn() -> Command + Send + Sync;
+
+/// A lazy subcommand's loader plus its one-time resolution cache. Shared
+/// (via `Arc`) across clones of the placeholder `Command` that carries it,
+/// so a clone never re-runs the loader independently of its origin — every
+/// clone observes the same cached resolution.
+#[derive(Clone)]
+struct Lazy {
+    loader: Arc<LoaderFn>,
+    cache: Arc<OnceLock<Command>>,
+}
+
+impl std::fmt::Debug for Lazy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Lazy(..)")
+    }
+}
+
 /// An error produced while executing a parsed command.
 #[derive(Debug)]
 pub enum RunError {
@@ -1255,6 +1273,7 @@ pub struct Command {
     setup: Option<LifecycleHook>,
     cleanup: Option<LifecycleHook>,
     plugins: Vec<Plugin>,
+    lazy: Option<Lazy>,
 }
 
 impl Command {
@@ -1276,6 +1295,73 @@ impl Command {
             setup: None,
             cleanup: None,
             plugins: Vec::new(),
+            lazy: None,
+        }
+    }
+
+    /// Adds a lazily-resolved subcommand. `loader` is an ordinary
+    /// synchronous closure producing the child `Command`; it runs at most
+    /// once for this shared command tree (and every clone of it — the
+    /// resolution cache is `Arc`-shared, not duplicated by `Clone`), the
+    /// first time the child is actually needed: selected during parsing or
+    /// execution, or resolved for usage/help metadata (description,
+    /// aliases, hidden state). Constructing or cloning the parent never
+    /// invokes `loader`.
+    ///
+    /// `name` is the subcommand's canonical identity, known without ever
+    /// invoking `loader` — this is what lets a direct canonical-name match
+    /// select this child, or detect it colliding with a sibling, without
+    /// resolving it or any unrelated lazy sibling. If the command `loader`
+    /// returns has a different own name, `name` wins: the resolved
+    /// command's name is overwritten to match the declared identity, so
+    /// `Matches::subcommand()` always reports `name` for a selection of
+    /// this child.
+    ///
+    /// A lazy child's own aliases are part of its loaded metadata, not its
+    /// declared identity, so matching an alias (rather than the canonical
+    /// name) against this child does require resolving it — and, mirroring
+    /// Citty, may also resolve other not-yet-resolved lazy siblings while
+    /// searching. A direct canonical-name match never pays this cost.
+    pub fn lazy_command<F>(mut self, name: impl Into<String>, loader: F) -> Self
+    where
+        F: Fn() -> Command + Send + Sync + 'static,
+    {
+        let mut placeholder = Command::new(name.into());
+        placeholder.lazy = Some(Lazy {
+            loader: Arc::new(loader),
+            cache: Arc::new(OnceLock::new()),
+        });
+        self.subcommands.push(placeholder);
+        self
+    }
+
+    /// Returns the resolved command backing `self`: `self` unchanged for an
+    /// ordinary (non-lazy) command, or the cached result of running the
+    /// loader for a lazy placeholder — running it first if this is the
+    /// first time. The declared canonical `name` always wins over whatever
+    /// name the loader's returned command carries.
+    fn resolved(&self) -> &Command {
+        match &self.lazy {
+            None => self,
+            Some(lazy) => lazy.cache.get_or_init(|| {
+                let mut resolved = (lazy.loader)();
+                resolved.name = self.name.clone();
+                resolved
+            }),
+        }
+    }
+
+    /// Aliases already known without invoking a lazy loader: an ordinary
+    /// command's own aliases, or — for a lazy child — its aliases if it has
+    /// already been resolved for some other reason, `false` otherwise.
+    /// Never triggers resolution itself.
+    fn has_known_alias(&self, name: &str) -> bool {
+        match &self.lazy {
+            None => self.aliases.iter().any(|a| a == name),
+            Some(lazy) => lazy
+                .cache
+                .get()
+                .is_some_and(|resolved| resolved.aliases.iter().any(|a| a == name)),
         }
     }
 
@@ -1298,9 +1384,10 @@ impl Command {
         self
     }
 
-    /// Returns whether the command has a handler set.
+    /// Returns whether the command has a handler set. For a lazy
+    /// subcommand this resolves it.
     pub fn has_handler(&self) -> bool {
-        self.handler.is_some()
+        self.resolved().handler.is_some()
     }
 
     /// Sets the command's setup hook, run before its selected child (if any)
@@ -1316,9 +1403,10 @@ impl Command {
         self
     }
 
-    /// Returns whether the command has a setup hook set.
+    /// Returns whether the command has a setup hook set. For a lazy
+    /// subcommand this resolves it.
     pub fn has_setup(&self) -> bool {
-        self.setup.is_some()
+        self.resolved().setup.is_some()
     }
 
     /// Sets the command's cleanup hook. Cleanup is attempted for every
@@ -1334,9 +1422,10 @@ impl Command {
         self
     }
 
-    /// Returns whether the command has a cleanup hook set.
+    /// Returns whether the command has a cleanup hook set. For a lazy
+    /// subcommand this resolves it.
     pub fn has_cleanup(&self) -> bool {
-        self.cleanup.is_some()
+        self.resolved().cleanup.is_some()
     }
 
     /// Attaches a plugin to the command. Repeated calls append; declaration
@@ -1364,9 +1453,10 @@ impl Command {
         self
     }
 
-    /// Returns the command's attached plugins, in declaration order.
+    /// Returns the command's attached plugins, in declaration order. For a
+    /// lazy subcommand this resolves it.
     pub fn plugins(&self) -> &[Plugin] {
-        &self.plugins
+        &self.resolved().plugins
     }
 
     /// Marks the command as hidden from generated usage/help listings.
@@ -1377,9 +1467,11 @@ impl Command {
         self
     }
 
-    /// Returns whether the command is hidden from usage/help listings.
+    /// Returns whether the command is hidden from usage/help listings. For
+    /// a lazy subcommand this resolves it — hidden is loaded metadata, like
+    /// description and aliases.
     pub fn is_hidden(&self) -> bool {
-        self.hidden
+        self.resolved().hidden
     }
 
     /// Adds a subcommand alias. Aliases are exact and case-sensitive.
@@ -1388,9 +1480,11 @@ impl Command {
         self
     }
 
-    /// Returns the command's aliases, in insertion order.
+    /// Returns the command's aliases, in insertion order. For a lazy
+    /// subcommand this resolves it, since aliases are loaded metadata, not
+    /// part of its declared identity — see [`Command::lazy_command`].
     pub fn aliases(&self) -> &[String] {
-        &self.aliases
+        &self.resolved().aliases
     }
 
     /// Sets the command description.
@@ -1411,9 +1505,13 @@ impl Command {
         self
     }
 
-    /// Returns the command's subcommands.
+    /// Returns the command's subcommands. Entries for not-yet-selected lazy
+    /// subcommands are returned as unresolved placeholders — their own
+    /// `name()` is always the declared canonical identity, but other
+    /// metadata (aliases, description, nested subcommands, ...) resolves
+    /// lazily the first time it's asked for.
     pub fn subcommands(&self) -> &[Command] {
-        &self.subcommands
+        &self.resolved().subcommands
     }
 
     /// Sets the subcommand to select automatically when no explicit child
@@ -1426,19 +1524,49 @@ impl Command {
 
     /// Returns the configured default-subcommand spelling, if any.
     pub fn get_default_subcommand(&self) -> Option<&str> {
-        self.default_subcommand.as_deref()
+        self.resolved().default_subcommand.as_deref()
     }
 
-    /// Returns subcommands eligible for usage/help listings, in declaration order.
+    /// Returns subcommands eligible for usage/help listings, in declaration
+    /// order. Called only while rendering usage for an already-resolved
+    /// command, so resolving each child here (via `is_hidden()`) to read
+    /// its real hidden state is the same trade Citty's usage rendering
+    /// makes — it needs the metadata regardless.
     fn visible_subcommands(&self) -> impl Iterator<Item = &Command> {
         self.subcommands.iter().filter(|c| !c.is_hidden())
     }
 
-    /// Returns every subcommand whose canonical name or an alias matches `name`.
+    /// Returns every subcommand whose canonical name or an alias matches
+    /// `name`, erring on the side of never resolving an unrelated lazy
+    /// sibling when a free (no-loader) match already answers the question.
+    ///
+    /// Every subcommand's canonical `name` is always known without
+    /// resolving it (declared identity), so a direct name match is always
+    /// free. Aliases are declared identity for an ordinary command but
+    /// loaded metadata for a lazy one, so:
+    ///
+    /// - if any sibling matches by canonical name, or by an alias already
+    ///   known without resolving (an ordinary command's own aliases, or a
+    ///   lazy sibling already resolved for another reason), that's the
+    ///   answer — no further resolution happens;
+    /// - only when nothing matches for free do we fall back to resolving
+    ///   every not-yet-resolved lazy sibling to search their aliases too,
+    ///   mirroring Citty: alias lookup lives in child metadata, so it may
+    ///   resolve children a direct canonical-name match never would.
     fn subcommands_matching(&self, name: &str) -> Vec<&Command> {
+        let free: Vec<&Command> = self
+            .subcommands
+            .iter()
+            .filter(|command| command.name() == name || command.has_known_alias(name))
+            .collect();
+
+        if !free.is_empty() {
+            return free;
+        }
+
         self.subcommands
             .iter()
-            .filter(|command| command.name() == name || command.aliases().iter().any(|a| a == name))
+            .filter(|command| command.resolved().aliases.iter().any(|a| a == name))
             .collect()
     }
 
@@ -1448,9 +1576,10 @@ impl Command {
         self
     }
 
-    /// Returns the command's positional arguments.
+    /// Returns the command's positional arguments. For a lazy subcommand
+    /// this resolves it.
     pub fn arguments(&self) -> &[Arg] {
-        &self.arguments
+        &self.resolved().arguments
     }
 
     /// Adds a flag.
@@ -1459,9 +1588,9 @@ impl Command {
         self
     }
 
-    /// Returns the command's flags.
+    /// Returns the command's flags. For a lazy subcommand this resolves it.
     pub fn flags(&self) -> &[Flag] {
-        &self.flags
+        &self.resolved().flags
     }
 
     /// Adds a string option.
@@ -1470,9 +1599,10 @@ impl Command {
         self
     }
 
-    /// Returns the command's string options.
+    /// Returns the command's string options. For a lazy subcommand this
+    /// resolves it.
     pub fn options(&self) -> &[StringOption] {
-        &self.options
+        &self.resolved().options
     }
 
     /// Adds an enum option.
@@ -1481,9 +1611,10 @@ impl Command {
         self
     }
 
-    /// Returns the command's enum options.
+    /// Returns the command's enum options. For a lazy subcommand this
+    /// resolves it.
     pub fn enum_options(&self) -> &[EnumOption] {
-        &self.enum_options
+        &self.resolved().enum_options
     }
 
     /// Returns every string option whose canonical name or an alias matches `name`.
@@ -1714,7 +1845,10 @@ impl Command {
             )
         })?;
 
-        Ok(Some(child))
+        // Every caller immediately treats the default child as "the command
+        // now being parsed/probed" — hand back its resolved form so a lazy
+        // default child's real schema is what gets consulted.
+        Ok(Some(child.resolved()))
     }
 
     /// Parses command-line arguments.
@@ -1727,7 +1861,7 @@ impl Command {
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect();
-        self.parse_tokens(&args)
+        self.resolved().parse_tokens(&args)
     }
 
     /// Parses `args` and executes the selected command's handler.
@@ -1789,7 +1923,7 @@ impl Command {
     /// root-only, single-token request, evaluated by `run_cli_from` only
     /// after this walk finds no help request.
     fn resolve_help<'a>(&'a self, args: &[String]) -> Result<Builtin<'a>, ParseError> {
-        let mut command = self;
+        let mut command = self.resolved();
         let mut display_name = self.name().to_owned();
         let mut inherited_version: Option<&'a str> = None;
         let mut terminated = false;
@@ -1861,7 +1995,10 @@ impl Command {
                 inherited_version = command.version.as_deref().or(inherited_version);
                 display_name.push(' ');
                 display_name.push_str(next.name());
-                command = next;
+                // Resolve now: the walk continues probing option arity
+                // against this child's own schema, which for a lazy child
+                // only exists once resolved. `.name()` above is unaffected.
+                command = next.resolved();
             }
 
             index += 1;
@@ -1906,10 +2043,11 @@ impl Command {
                 command.render_usage_named(&display_name, inherited_version),
             )),
             Builtin::None => {
+                let this = self.resolved();
                 if let [token] = args.as_slice()
-                    && self.builtin_version_token(token)
+                    && this.builtin_version_token(token)
                 {
-                    return match self.version.as_deref() {
+                    return match this.version.as_deref() {
                         Some(version) => Ok(CliAction::Version(version.to_owned())),
                         None => Err(RunError::NoVersion),
                     };
@@ -1956,15 +2094,21 @@ impl Command {
         matches: &'a Matches,
         root_matches: &'a Matches,
     ) -> Result<CommandOutput, RunError> {
+        // Resolve once up front: a lazy leaf's real lifecycle (plugins,
+        // setup/cleanup, handler) is what must run, never a placeholder's
+        // (empty) one. Cached, so this is a no-op after the first call for
+        // a given lazy child, and a no-op always for an ordinary command.
+        let this = self.resolved();
+
         let context = CommandContext {
-            command: self,
+            command: this,
             matches,
             root_matches,
         };
 
         let mut primary: Result<CommandOutput, RunError> = Ok(CommandOutput::new(()));
 
-        for plugin in &self.plugins {
+        for plugin in &this.plugins {
             if let Some(setup) = &plugin.setup
                 && let Err(err) = (setup.0)(&context)
             {
@@ -1977,24 +2121,24 @@ impl Command {
         }
 
         if primary.is_ok()
-            && let Some(setup) = &self.setup
+            && let Some(setup) = &this.setup
             && let Err(err) = (setup.0)(&context)
         {
             primary = Err(RunError::Setup(err));
         }
 
         if primary.is_ok() {
-            primary = self.execute_work(matches, root_matches, &context);
+            primary = this.execute_work(matches, root_matches, &context);
         }
 
-        if let Some(cleanup) = &self.cleanup
+        if let Some(cleanup) = &this.cleanup
             && let Err(err) = (cleanup.0)(&context)
             && primary.is_ok()
         {
             primary = Err(RunError::Cleanup(err));
         }
 
-        for plugin in self.plugins.iter().rev() {
+        for plugin in this.plugins.iter().rev() {
             if let Some(cleanup) = &plugin.cleanup
                 && let Err(err) = (cleanup.0)(&context)
                 && primary.is_ok()
@@ -2305,6 +2449,12 @@ impl Command {
                 }
 
                 if let Some(child) = candidates.first() {
+                    // Resolve now: a lazy child's own schema (flags,
+                    // options, positionals, nested subcommands) is what
+                    // must parse its remaining tokens, never a
+                    // placeholder's empty one. `.name()` is unaffected —
+                    // it's the declared canonical identity either way.
+                    let child = child.resolved();
                     self.finalize(&mut matches, positional)?;
                     let child_matches = child.parse_tokens(&args[index + 1..])?;
                     matches.subcommand = Some(child.name().to_owned());
@@ -2454,14 +2604,16 @@ impl Command {
         &self.name
     }
 
-    /// Returns the command description.
+    /// Returns the command description. For a lazy subcommand this
+    /// resolves it, since the description is loaded metadata.
     pub fn get_description(&self) -> Option<&str> {
-        self.description.as_deref()
+        self.resolved().description.as_deref()
     }
 
-    /// Returns the command version.
+    /// Returns the command version. For a lazy subcommand this resolves
+    /// it, since the version is loaded metadata.
     pub fn get_version(&self) -> Option<&str> {
-        self.version.as_deref()
+        self.resolved().version.as_deref()
     }
 
     /// Renders usage for this command under `display_name`, falling back to
@@ -2512,7 +2664,8 @@ impl Command {
     /// subcommands are omitted from the listing and the synopsis, but remain
     /// fully parseable — hidden is presentation-only.
     pub fn render_usage(&self) -> String {
-        self.render_usage_named(self.name(), None)
+        let this = self.resolved();
+        this.render_usage_named(this.name(), None)
     }
 
     /// Writes the rendered usage to stdout, propagating any I/O error rather
@@ -9192,5 +9345,499 @@ mod tests {
         let action = command.run_cli_from([] as [&str; 0]).unwrap();
 
         assert!(matches!(action, CliAction::Ran));
+    }
+
+    // --- Lazy subcommands ---
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn lazy_command_construction_does_not_invoke_loader() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let _command = Command::new("root").lazy_command("build", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("build")
+        });
+
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cloning_lazy_command_does_not_invoke_loader() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root").lazy_command("build", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("build")
+        });
+        let _clone = command.clone();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn selecting_eager_sibling_does_not_resolve_lazy_siblings() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root")
+            .command(Command::new("build").handler(|_ctx| Ok(())))
+            .lazy_command("test", move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Command::new("test").handler(|_ctx| Ok(()))
+            });
+
+        command.run_from(["build"]).unwrap();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn canonical_lazy_selection_invokes_loader_exactly_once() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root").lazy_command("build", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("build").handler(|_ctx| Ok(()))
+        });
+
+        command.run_from(["build"]).unwrap();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parse_and_execute_share_one_resolution() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root").lazy_command("build", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("build").handler(|_ctx| Ok(42usize))
+        });
+
+        let matches = command.parse_from(["build"]).unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        let output = command.execute(&matches, &matches).unwrap();
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn repeated_parsing_of_same_tree_does_not_reinvoke_loader() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root").lazy_command("build", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("build").handler(|_ctx| Ok(()))
+        });
+
+        command.parse_from(["build"]).unwrap();
+        command.parse_from(["build"]).unwrap();
+        command.run_from(["build"]).unwrap();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cloned_command_shares_lazy_resolution_cache() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root").lazy_command("build", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("build").handler(|_ctx| Ok(()))
+        });
+
+        let clone = command.clone();
+        clone.run_from(["build"]).unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        command.run_from(["build"]).unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn usage_resolution_of_lazy_child_is_cached_for_later_execution() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root").lazy_command("build", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("build").handler(|_ctx| Ok(()))
+        });
+
+        let _usage = command.render_usage();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        command.run_from(["build"]).unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lazy_handler_output_propagates_through_command_output() {
+        let command = Command::new("root").lazy_command("build", || {
+            Command::new("build").handler(|_ctx| Ok(42usize))
+        });
+
+        let output = command.run_from(["build"]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn lazy_handler_failure_becomes_run_error_handler() {
+        let command = Command::new("root").lazy_command("build", || {
+            Command::new("build").handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError))
+        });
+
+        let error = command.run_from(["build"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+    }
+
+    #[test]
+    fn lazy_child_argument_parsing_matches_eager_behavior() {
+        let command = Command::new("root").lazy_command("greet", || {
+            Command::new("greet")
+                .arg(Arg::new("name").required())
+                .handler(|ctx| Ok(ctx.matches().argument("name").unwrap().to_owned()))
+        });
+
+        let output = command.run_from(["greet", "world"]).unwrap();
+
+        assert_eq!(output.downcast::<String>().unwrap(), "world");
+
+        let error = command.run_from(["greet"]).unwrap_err();
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn lazy_child_boolean_equals_value_works() {
+        let command = Command::new("root").lazy_command("build", || {
+            Command::new("build")
+                .flag(Flag::new("release"))
+                .handler(|ctx| Ok(ctx.matches().flag("release")))
+        });
+
+        let output = command.run_from(["build", "--release=true"]).unwrap();
+
+        assert!(output.downcast::<bool>().unwrap());
+    }
+
+    #[test]
+    fn lazy_child_string_and_enum_options_work() {
+        let command = Command::new("root").lazy_command("build", || {
+            Command::new("build")
+                .option(StringOption::new("target"))
+                .enum_option(EnumOption::new("mode", ["debug", "release"]))
+                .handler(|ctx| {
+                    Ok((
+                        ctx.matches().option("target").unwrap().to_owned(),
+                        ctx.matches().enum_option("mode").unwrap().to_owned(),
+                    ))
+                })
+        });
+
+        let output = command
+            .run_from(["build", "--target", "wasm", "--mode", "release"])
+            .unwrap();
+
+        assert_eq!(
+            output.downcast::<(String, String)>().unwrap(),
+            ("wasm".to_owned(), "release".to_owned())
+        );
+    }
+
+    #[test]
+    fn lazy_declared_name_overrides_loaders_returned_name() {
+        let command = Command::new("root")
+            .lazy_command("build", || Command::new("compile").handler(|_ctx| Ok(())));
+
+        let matches = command.parse_from(["build"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn lazy_subcommand_selected_by_alias_canonicalizes() {
+        let command = Command::new("root").lazy_command("install", || {
+            Command::new("install").alias("i").handler(|_ctx| Ok(()))
+        });
+
+        let matches = command.parse_from(["i"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("install"));
+    }
+
+    #[test]
+    fn eager_alias_collides_with_lazy_canonical_name_is_ambiguous() {
+        let command = Command::new("root")
+            .command(Command::new("install").alias("build"))
+            .lazy_command("build", || Command::new("build"));
+
+        let error = command.parse_from(["build"]).unwrap_err();
+
+        assert_eq!(error.kind(), ParseErrorKind::AmbiguousCommand);
+    }
+
+    #[test]
+    fn two_lazy_siblings_with_the_same_canonical_name_are_ambiguous() {
+        let command = Command::new("root")
+            .lazy_command("build", || Command::new("build"))
+            .lazy_command("build", || Command::new("build"));
+
+        let error = command.parse_from(["build"]).unwrap_err();
+
+        assert_eq!(error.kind(), ParseErrorKind::AmbiguousCommand);
+    }
+
+    #[test]
+    fn lazy_canonical_name_colliding_with_eager_canonical_name_is_ambiguous() {
+        let command = Command::new("root")
+            .command(Command::new("build"))
+            .lazy_command("build", || Command::new("build"));
+
+        let error = command.parse_from(["build"]).unwrap_err();
+
+        assert_eq!(error.kind(), ParseErrorKind::AmbiguousCommand);
+    }
+
+    #[test]
+    fn nested_lazy_subcommands_resolve_only_the_selected_path() {
+        let remote_loads = Arc::new(AtomicUsize::new(0));
+        let add_loads = Arc::new(AtomicUsize::new(0));
+        let remote_counter = remote_loads.clone();
+        let add_counter_outer = add_loads.clone();
+
+        let command = Command::new("root").lazy_command("remote", move || {
+            remote_counter.fetch_add(1, Ordering::SeqCst);
+            let add_counter = add_counter_outer.clone();
+            Command::new("remote").lazy_command("add", move || {
+                add_counter.fetch_add(1, Ordering::SeqCst);
+                Command::new("add").handler(|_ctx| Ok(()))
+            })
+        });
+
+        command.run_from(["remote", "add"]).unwrap();
+
+        assert_eq!(remote_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(add_loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn eager_parent_with_lazy_child_resolves_only_when_selected() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command =
+            Command::new("root").command(Command::new("remote").lazy_command("add", move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Command::new("add").handler(|_ctx| Ok(()))
+            }));
+
+        command.run_from(["remote", "add"]).unwrap();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lazy_parent_with_eager_child_resolves_parent_once() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = loads.clone();
+
+        let command = Command::new("root").lazy_command("remote", move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Command::new("remote").command(Command::new("add").handler(|_ctx| Ok(())))
+        });
+
+        command.run_from(["remote", "add"]).unwrap();
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn selecting_build_does_not_invoke_unrelated_test_or_remote_add_loaders() {
+        let test_loads = Arc::new(AtomicUsize::new(0));
+        let add_loads = Arc::new(AtomicUsize::new(0));
+        let test_counter = test_loads.clone();
+        let add_counter = add_loads.clone();
+
+        let command = Command::new("root")
+            .command(Command::new("build").handler(|_ctx| Ok(())))
+            .lazy_command("test", move || {
+                test_counter.fetch_add(1, Ordering::SeqCst);
+                Command::new("test").handler(|_ctx| Ok(()))
+            })
+            .command(Command::new("remote").lazy_command("add", move || {
+                add_counter.fetch_add(1, Ordering::SeqCst);
+                Command::new("add").handler(|_ctx| Ok(()))
+            }));
+
+        command.run_from(["build"]).unwrap();
+
+        assert_eq!(test_loads.load(Ordering::SeqCst), 0);
+        assert_eq!(add_loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn selecting_remote_add_does_not_invoke_unrelated_test_loader() {
+        let test_loads = Arc::new(AtomicUsize::new(0));
+        let test_counter = test_loads.clone();
+
+        let command = Command::new("root")
+            .command(Command::new("build").handler(|_ctx| Ok(())))
+            .lazy_command("test", move || {
+                test_counter.fetch_add(1, Ordering::SeqCst);
+                Command::new("test").handler(|_ctx| Ok(()))
+            })
+            .command(
+                Command::new("remote")
+                    .lazy_command("add", || Command::new("add").handler(|_ctx| Ok(()))),
+            );
+
+        command.run_from(["remote", "add"]).unwrap();
+
+        assert_eq!(test_loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn default_subcommand_resolves_lazy_child() {
+        let command = Command::new("root")
+            .default_subcommand("serve")
+            .lazy_command("serve", || {
+                Command::new("serve")
+                    .flag(Flag::new("watch"))
+                    .handler(|ctx| Ok(ctx.matches().flag("watch")))
+            });
+
+        let output = command.run_from(["--watch"]).unwrap();
+
+        assert!(output.downcast::<bool>().unwrap());
+    }
+
+    #[test]
+    fn default_subcommand_resolves_through_lazy_alias() {
+        let command = Command::new("root")
+            .default_subcommand("s")
+            .lazy_command("serve", || {
+                Command::new("serve").alias("s").handler(|_ctx| Ok(()))
+            });
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("serve"));
+    }
+
+    #[test]
+    fn nested_default_chain_through_lazy_and_eager_commands() {
+        let command = Command::new("root")
+            .default_subcommand("remote")
+            .lazy_command("remote", || {
+                Command::new("remote").default_subcommand("add").command(
+                    Command::new("add")
+                        .flag(Flag::new("verbose"))
+                        .handler(|ctx| Ok(ctx.matches().flag("verbose"))),
+                )
+            });
+
+        let output = command.run_from(["--verbose"]).unwrap();
+
+        assert!(output.downcast::<bool>().unwrap());
+    }
+
+    #[test]
+    fn builtin_help_targets_lazy_child_without_running_its_handler() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+
+        let command = Command::new("root").lazy_command("build", move || {
+            let counter = counter.clone();
+            Command::new("build")
+                .description("Build the project")
+                .handler(move |_ctx| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+        });
+
+        let action = command.run_cli_from(["build", "--help"]).unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("Build the project")),
+            other => panic!("expected Help, got {other:?}"),
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nested_lazy_help_renders_resolved_grandchild_usage() {
+        let command = Command::new("root").lazy_command("remote", || {
+            Command::new("remote").lazy_command("add", || {
+                Command::new("add")
+                    .description("Add a remote")
+                    .handler(|_ctx| Ok(()))
+            })
+        });
+
+        let action = command.run_cli_from(["remote", "add", "--help"]).unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("Add a remote")),
+            other => panic!("expected Help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hidden_lazy_subcommand_omitted_from_usage() {
+        let command = Command::new("root")
+            .lazy_command("secret", || {
+                Command::new("secret").hidden().handler(|_ctx| Ok(()))
+            })
+            .lazy_command("build", || Command::new("build").handler(|_ctx| Ok(())));
+
+        let usage = command.render_usage();
+
+        assert!(!usage.contains("secret"));
+        assert!(usage.contains("build"));
+    }
+
+    #[test]
+    fn command_with_lazy_subcommand_is_clone() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<Command>();
+
+        let command = Command::new("root").lazy_command("build", || Command::new("build"));
+        let _clone = command.clone();
+    }
+
+    #[test]
+    fn command_with_lazy_subcommand_has_useful_debug() {
+        let command = Command::new("root").lazy_command("build", || Command::new("build"));
+
+        let rendered = format!("{command:?}");
+
+        assert!(rendered.contains("root"));
+    }
+
+    #[test]
+    fn lazy_handler_output_carries_no_extra_bounds() {
+        let command = Command::new("root").lazy_command("build", || {
+            Command::new("build").handler(|_ctx| {
+                let cell = std::rc::Rc::new(std::cell::Cell::new(7));
+                Ok(NotDebugCloneSendSync(cell))
+            })
+        });
+
+        let output = command.run_from(["build"]).unwrap();
+
+        let value = output.downcast::<NotDebugCloneSendSync>().unwrap();
+        assert_eq!(value.0.get(), 7);
     }
 }
