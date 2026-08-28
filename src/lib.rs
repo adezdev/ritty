@@ -484,6 +484,7 @@ pub struct Command {
     flags: Vec<Flag>,
     options: Vec<StringOption>,
     enum_options: Vec<EnumOption>,
+    default_subcommand: Option<String>,
 }
 
 impl Command {
@@ -499,6 +500,7 @@ impl Command {
             flags: Vec::new(),
             options: Vec::new(),
             enum_options: Vec::new(),
+            default_subcommand: None,
         }
     }
 
@@ -534,6 +536,19 @@ impl Command {
     /// Returns the command's subcommands.
     pub fn subcommands(&self) -> &[Command] {
         &self.subcommands
+    }
+
+    /// Sets the subcommand to select automatically when no explicit child
+    /// is chosen. May name a child's canonical name or one of its aliases;
+    /// resolved at parse time.
+    pub fn default_subcommand(mut self, name: impl Into<String>) -> Self {
+        self.default_subcommand = Some(name.into());
+        self
+    }
+
+    /// Returns the configured default-subcommand spelling, if any.
+    pub fn get_default_subcommand(&self) -> Option<&str> {
+        self.default_subcommand.as_deref()
     }
 
     /// Returns every subcommand whose canonical name or an alias matches `name`.
@@ -922,6 +937,24 @@ impl Command {
         }
 
         self.finalize(&mut matches, positional)?;
+
+        if let Some(default_name) = &self.default_subcommand {
+            let candidates = self.subcommands_matching(default_name);
+
+            if candidates.len() > 1 {
+                return Err(ParseError {
+                    message: format!("ambiguous command: {default_name}"),
+                });
+            }
+
+            let child = candidates.first().ok_or_else(|| ParseError {
+                message: format!("default subcommand not found: {default_name}"),
+            })?;
+
+            let child_matches = child.parse_tokens(&[])?;
+            matches.subcommand = Some(child.name().to_owned());
+            matches.subcommand_matches = Some(Box::new(child_matches));
+        }
 
         Ok(matches)
     }
@@ -2970,5 +3003,243 @@ mod tests {
 
         assert_eq!(matches.subcommand(), None);
         assert!(matches.subcommand_matches().is_none());
+    }
+
+    #[test]
+    fn new_command_has_no_default_subcommand() {
+        let command = Command::new("root");
+
+        assert_eq!(command.get_default_subcommand(), None);
+    }
+
+    #[test]
+    fn default_subcommand_builder_stores_exact_spelling() {
+        let command = Command::new("root").default_subcommand("b");
+
+        assert_eq!(command.get_default_subcommand(), Some("b"));
+        assert_eq!(command.aliases(), &[] as &[String]);
+    }
+
+    #[test]
+    fn empty_argv_selects_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+        assert!(matches.subcommand_matches().is_some());
+    }
+
+    #[test]
+    fn default_subcommand_alias_resolves_to_canonical_name() {
+        let command = Command::new("root")
+            .default_subcommand("b")
+            .command(Command::new("build").alias("b"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn explicit_child_overrides_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build"))
+            .command(Command::new("test"));
+
+        let matches = command.parse_from(["test"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("test"));
+    }
+
+    #[test]
+    fn explicit_child_alias_overrides_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build"))
+            .command(Command::new("test").alias("t"));
+
+        let matches = command.parse_from(["t"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("test"));
+    }
+
+    #[test]
+    fn parent_boolean_option_consumed_before_default_subcommand() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose"))
+            .default_subcommand("build")
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--verbose"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn parent_value_option_consumed_before_default_subcommand() {
+        let command = Command::new("root")
+            .option(StringOption::new("profile"))
+            .default_subcommand("build")
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--profile", "release"]).unwrap();
+
+        assert_eq!(matches.option("profile"), Some("release"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn parent_positional_retained_before_default_subcommand() {
+        let command = Command::new("root")
+            .arg(Arg::new("workspace"))
+            .default_subcommand("build")
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["project"]).unwrap();
+
+        assert_eq!(matches.argument("workspace"), Some("project"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn parent_defaults_applied_before_default_subcommand_selection() {
+        let command = Command::new("root")
+            .option(StringOption::new("profile").default("release"))
+            .default_subcommand("build")
+            .command(Command::new("build"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.option("profile"), Some("release"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn parent_required_validation_precedes_default_subcommand_selection() {
+        let command = Command::new("root")
+            .option(StringOption::new("profile").required())
+            .default_subcommand("build")
+            .command(Command::new("build"));
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required option: --profile");
+    }
+
+    #[test]
+    fn default_subcommand_child_receives_own_defaults() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build").option(StringOption::new("target").default("native")));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("target"),
+            Some("native")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_child_required_validation_propagates() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build").option(StringOption::new("target").required()));
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required option: --target");
+    }
+
+    #[test]
+    fn recursive_default_subcommand_chain_resolves_at_every_level() {
+        let command = Command::new("root").default_subcommand("remote").command(
+            Command::new("remote")
+                .default_subcommand("status")
+                .command(Command::new("status")),
+        );
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("remote"));
+        let remote_matches = matches.subcommand_matches().unwrap();
+        assert_eq!(remote_matches.subcommand(), Some("status"));
+        assert!(remote_matches.subcommand_matches().is_some());
+    }
+
+    #[test]
+    fn missing_configured_default_subcommand_errors() {
+        let command = Command::new("root").default_subcommand("build");
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "default subcommand not found: build");
+    }
+
+    #[test]
+    fn ambiguous_configured_default_subcommand_errors() {
+        let command = Command::new("root")
+            .default_subcommand("x")
+            .command(Command::new("first").alias("x"))
+            .command(Command::new("second").alias("x"));
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous command: x");
+    }
+
+    #[test]
+    fn default_canonical_vs_alias_collision_errors() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build"))
+            .command(Command::new("deploy").alias("build"));
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous command: build");
+    }
+
+    #[test]
+    fn duplicate_alias_within_one_child_does_not_self_collide_as_default() {
+        let command = Command::new("root")
+            .default_subcommand("b")
+            .command(Command::new("build").alias("b").alias("b"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn unknown_parent_option_is_not_forwarded_to_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build").option(StringOption::new("target")));
+
+        let error = command.parse_from(["--target", "wasm"]).unwrap_err();
+
+        assert_eq!(error.message(), "unknown flag: --target");
+    }
+
+    #[test]
+    fn explicit_child_argv_behavior_unchanged_with_default_configured() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build").option(StringOption::new("target")))
+            .command(Command::new("test"));
+
+        let matches = command.parse_from(["build", "--target", "wasm"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("target"),
+            Some("wasm")
+        );
     }
 }
