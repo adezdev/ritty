@@ -76,17 +76,71 @@ impl Arg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringOption {
     name: String,
+    description: Option<String>,
+    value_hint: Option<String>,
+    required: bool,
+    default: Option<String>,
 }
 
 impl StringOption {
     /// Creates a new string option.
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            description: None,
+            value_hint: None,
+            required: false,
+            default: None,
+        }
+    }
+
+    /// Sets the option description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Sets the option's value hint, for usage rendering.
+    pub fn value_hint(mut self, value_hint: impl Into<String>) -> Self {
+        self.value_hint = Some(value_hint.into());
+        self
+    }
+
+    /// Marks the option as required.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Sets the default value used when the option is not supplied.
+    pub fn default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
     }
 
     /// Returns the option name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns whether the option is required.
+    pub fn is_required(&self) -> bool {
+        self.required
+    }
+
+    /// Returns the option's default value, if any.
+    pub fn default_value(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+
+    /// Returns the option description.
+    pub fn get_description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Returns the option's value hint.
+    pub fn get_value_hint(&self) -> Option<&str> {
+        self.value_hint.as_deref()
     }
 }
 
@@ -361,6 +415,24 @@ impl Command {
                 None if argument.is_required() => {
                     return Err(ParseError {
                         message: format!("missing required argument: {}", argument.name()),
+                    });
+                }
+                None => {}
+            }
+        }
+
+        for option in &self.options {
+            if matches.option(option.name()).is_some() {
+                continue;
+            }
+
+            match option.default_value() {
+                Some(default) => matches
+                    .options
+                    .push((option.name().to_owned(), default.to_owned())),
+                None if option.is_required() => {
+                    return Err(ParseError {
+                        message: format!("missing required option: --{}", option.name()),
                     });
                 }
                 None => {}
@@ -769,5 +841,154 @@ mod tests {
         let error = command.parse_from(["--wat"]).unwrap_err();
 
         assert_eq!(error.message(), "unknown flag: --wat");
+    }
+
+    #[test]
+    fn string_option_metadata_defaults_to_none() {
+        let option = StringOption::new("output");
+
+        assert!(!option.is_required());
+        assert_eq!(option.default_value(), None);
+        assert_eq!(option.get_description(), None);
+        assert_eq!(option.get_value_hint(), None);
+    }
+
+    #[test]
+    fn configures_string_option_metadata() {
+        let option = StringOption::new("output")
+            .description("Output directory")
+            .value_hint("dir")
+            .required()
+            .default(".");
+
+        assert_eq!(option.name(), "output");
+        assert_eq!(option.get_description(), Some("Output directory"));
+        assert_eq!(option.get_value_hint(), Some("dir"));
+        assert!(option.is_required());
+        assert_eq!(option.default_value(), Some("."));
+    }
+
+    #[test]
+    fn missing_optional_string_option_remains_absent() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.option("name"), None);
+    }
+
+    #[test]
+    fn missing_string_option_uses_default() {
+        let command = Command::new("ritty").option(StringOption::new("name").default("world"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("world"));
+    }
+
+    #[test]
+    fn explicit_string_option_value_overrides_default() {
+        let command = Command::new("ritty").option(StringOption::new("name").default("world"));
+
+        let separate = command.parse_from(["--name", "alice"]).unwrap();
+        let equals = command.parse_from(["--name=alice"]).unwrap();
+
+        assert_eq!(separate.option("name"), Some("alice"));
+        assert_eq!(equals.option("name"), Some("alice"));
+    }
+
+    #[test]
+    fn rejects_missing_required_string_option() {
+        let command = Command::new("ritty").option(StringOption::new("name").required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required option: --name");
+    }
+
+    #[test]
+    fn accepts_required_string_option_when_supplied() {
+        let command = Command::new("ritty").option(StringOption::new("name").required());
+
+        let matches = command.parse_from(["--name", "alice"]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("alice"));
+    }
+
+    #[test]
+    fn required_string_option_with_default_is_satisfied_when_omitted() {
+        let command =
+            Command::new("ritty").option(StringOption::new("name").required().default("world"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("world"));
+    }
+
+    #[test]
+    fn multiple_string_option_defaults_apply_independently() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("first").default("a"))
+            .option(StringOption::new("second").default("b"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.option("first"), Some("a"));
+        assert_eq!(matches.option("second"), Some("b"));
+    }
+
+    #[test]
+    fn mixed_explicit_and_default_string_options() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("first").default("a"))
+            .option(StringOption::new("second").default("b"));
+
+        let matches = command.parse_from(["--first", "x"]).unwrap();
+
+        assert_eq!(matches.option("first"), Some("x"));
+        assert_eq!(matches.option("second"), Some("b"));
+    }
+
+    #[test]
+    fn hyphen_prefixed_explicit_value_overrides_string_option_default() {
+        let command = Command::new("ritty").option(StringOption::new("pattern").default("default"));
+
+        let matches = command.parse_from(["--pattern", "--literal"]).unwrap();
+
+        assert_eq!(matches.option("pattern"), Some("--literal"));
+    }
+
+    #[test]
+    fn flag_does_not_satisfy_required_string_option() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("name").required())
+            .flag(Flag::new("verbose"));
+
+        let error = command.parse_from(["--verbose"]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required option: --name");
+    }
+
+    #[test]
+    fn subcommand_does_not_satisfy_required_string_option() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("name").required())
+            .command(Command::new("build"));
+
+        let error = command.parse_from(["build"]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required option: --name");
+    }
+
+    #[test]
+    fn string_option_default_does_not_affect_positional_state() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("name").default("world"))
+            .arg(Arg::new("target").required());
+
+        let matches = command.parse_from(["value"]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("world"));
+        assert_eq!(matches.argument("target"), Some("value"));
     }
 }
