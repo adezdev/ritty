@@ -977,18 +977,94 @@ impl<'a> CommandContext<'a> {
 /// A boxed error, as returned by a failing handler.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// The result returned by a command handler.
-pub type HandlerResult = Result<(), BoxError>;
+/// The result returned by a command handler. Lifecycle hooks (setup,
+/// cleanup, plugin setup/cleanup) use the default `T = ()`; command handlers
+/// may return any `'static` `T`, which `Command::handler` erases into a
+/// [`CommandOutput`].
+pub type HandlerResult<T = ()> = Result<T, BoxError>;
 
-/// A shared, cloneable callable used for handlers, setup hooks, and cleanup
-/// hooks alike. Wrapped so `Command` can derive a meaningful `Debug` without
-/// trying to print closure internals.
-#[derive(Clone)]
-struct Hook(Arc<dyn for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync>);
+/// A type-erased handler success value, returned by [`Command::run_from`].
+///
+/// Handlers may return any `'static` Rust value; `CommandOutput` stores it
+/// behind `Box<dyn Any>` without requiring `Clone`, `Debug`, `Send`, or
+/// `Sync` from the contained type. Recover the value with [`Self::downcast`]
+/// or inspect it with [`Self::is`]/[`Self::downcast_ref`].
+pub struct CommandOutput {
+    value: Box<dyn std::any::Any>,
+    type_name: &'static str,
+}
 
-impl std::fmt::Debug for Hook {
+impl CommandOutput {
+    /// Wraps `value`, recording its type name for `Debug`/`type_name`.
+    pub fn new<T: 'static>(value: T) -> Self {
+        Self {
+            value: Box::new(value),
+            type_name: std::any::type_name::<T>(),
+        }
+    }
+
+    /// Returns whether the contained value is of type `T`.
+    pub fn is<T: 'static>(&self) -> bool {
+        self.value.is::<T>()
+    }
+
+    /// Returns a reference to the contained value if it is of type `T`.
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.value.downcast_ref::<T>()
+    }
+
+    /// Consumes `self`, returning the contained value if it is of type `T`,
+    /// or the original `CommandOutput` unchanged if it is not.
+    pub fn downcast<T: 'static>(self) -> Result<T, Self> {
+        match self.value.downcast::<T>() {
+            Ok(value) => Ok(*value),
+            Err(value) => Err(Self {
+                value,
+                type_name: self.type_name,
+            }),
+        }
+    }
+
+    /// Returns the type name of the contained value, as recorded by
+    /// [`Self::new`].
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+}
+
+impl std::fmt::Debug for CommandOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Hook(..)")
+        f.debug_struct("CommandOutput")
+            .field("type_name", &self.type_name)
+            .finish()
+    }
+}
+
+type HandlerFn =
+    dyn for<'a> Fn(&CommandContext<'a>) -> Result<CommandOutput, BoxError> + Send + Sync;
+
+/// A shared, cloneable command handler. Returns a type-erased
+/// [`CommandOutput`] so `Command` does not need to be generic; wrapped so
+/// `Command` can derive a meaningful `Debug` without trying to print closure
+/// internals.
+#[derive(Clone)]
+struct Handler(Arc<HandlerFn>);
+
+impl std::fmt::Debug for Handler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Handler(..)")
+    }
+}
+
+/// A shared, cloneable callable used for setup and cleanup hooks (command
+/// and plugin alike). Unlike `Handler`, these remain strictly
+/// unit-returning: lifecycle hooks do not contribute to `CommandOutput`.
+#[derive(Clone)]
+struct LifecycleHook(Arc<dyn for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync>);
+
+impl std::fmt::Debug for LifecycleHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LifecycleHook(..)")
     }
 }
 
@@ -1026,8 +1102,9 @@ pub enum RunError {
         /// The original error returned by the plugin's cleanup hook.
         source: BoxError,
     },
-    /// A built-in `--version`/`-v` request resolved to a command that
-    /// declares no version and inherits none from an ancestor.
+    /// An enabled root built-in `--version`/`-v` request was made using the
+    /// exact single-token CLI form, but the root command declares no
+    /// version.
     NoVersion,
     /// Writing a built-in help/version response to stdout failed.
     Io(std::io::Error),
@@ -1087,8 +1164,8 @@ impl From<ParseError> for RunError {
 #[derive(Debug, Clone)]
 pub struct Plugin {
     name: String,
-    setup: Option<Hook>,
-    cleanup: Option<Hook>,
+    setup: Option<LifecycleHook>,
+    cleanup: Option<LifecycleHook>,
 }
 
 impl Plugin {
@@ -1112,7 +1189,7 @@ impl Plugin {
     where
         F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
     {
-        self.setup = Some(Hook(Arc::new(setup)));
+        self.setup = Some(LifecycleHook(Arc::new(setup)));
         self
     }
 
@@ -1127,7 +1204,7 @@ impl Plugin {
     where
         F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
     {
-        self.cleanup = Some(Hook(Arc::new(cleanup)));
+        self.cleanup = Some(LifecycleHook(Arc::new(cleanup)));
         self
     }
 
@@ -1150,9 +1227,9 @@ pub struct Command {
     enum_options: Vec<EnumOption>,
     default_subcommand: Option<String>,
     hidden: bool,
-    handler: Option<Hook>,
-    setup: Option<Hook>,
-    cleanup: Option<Hook>,
+    handler: Option<Handler>,
+    setup: Option<LifecycleHook>,
+    cleanup: Option<LifecycleHook>,
     plugins: Vec<Plugin>,
 }
 
@@ -1180,11 +1257,20 @@ impl Command {
 
     /// Sets the command's handler, invoked when this command is selected for
     /// execution by `run_from`. Ordinary captured closures are supported.
-    pub fn handler<F>(mut self, handler: F) -> Self
+    ///
+    /// The handler may return any `'static` success value `T` — including
+    /// `()`, as in `.handler(|_ctx| Ok(()))` — which `run_from` reports back
+    /// as a type-erased [`CommandOutput`]. The value itself is never
+    /// required to be `Clone`, `Debug`, `Send`, or `Sync`; only the handler
+    /// closure carries those bounds.
+    pub fn handler<F, T>(mut self, handler: F) -> Self
     where
-        F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
+        T: 'static,
+        F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult<T> + Send + Sync + 'static,
     {
-        self.handler = Some(Hook(Arc::new(handler)));
+        self.handler = Some(Handler(Arc::new(move |ctx| {
+            handler(ctx).map(CommandOutput::new)
+        })));
         self
     }
 
@@ -1202,7 +1288,7 @@ impl Command {
     where
         F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
     {
-        self.setup = Some(Hook(Arc::new(setup)));
+        self.setup = Some(LifecycleHook(Arc::new(setup)));
         self
     }
 
@@ -1220,7 +1306,7 @@ impl Command {
     where
         F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
     {
-        self.cleanup = Some(Hook(Arc::new(cleanup)));
+        self.cleanup = Some(LifecycleHook(Arc::new(cleanup)));
         self
     }
 
@@ -1628,12 +1714,24 @@ impl Command {
     /// resulting `Matches` tree together, following the canonical subcommand
     /// selection parsing already made (explicit, aliased, or default) rather
     /// than re-examining argv. Only the selected leaf's handler runs — a
-    /// parent's handler is not invoked when a child is selected.
+    /// parent's handler is not invoked when a child is selected, and its
+    /// [`CommandOutput`] propagates back through every ancestor unchanged to
+    /// become the result of this call. An empty command with no handler, or
+    /// a selected leaf with no handler and no subcommands, succeeds with a
+    /// unit `CommandOutput`.
     ///
     /// This is a synchronous, programmatic API: it does not read
     /// `std::env::args`, print, exit, render usage, or special-case
     /// help/version.
-    pub fn run_from<I, S>(&self, args: I) -> Result<(), RunError>
+    ///
+    /// Divergence from Citty v0.2.2: upstream's `runCommand` recurses into a
+    /// selected subcommand without assigning its returned `result`, so a
+    /// parent's programmatic result is always `undefined` when a child ran.
+    /// Ritty's execution model invokes only the selected leaf's handler, so
+    /// the coherent behavior is to propagate that leaf's output through
+    /// every parent frame — this is a deliberate divergence, not an
+    /// oversight.
+    pub fn run_from<I, S>(&self, args: I) -> Result<CommandOutput, RunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -1795,6 +1893,8 @@ impl Command {
                     };
                 }
 
+                // The programmatic result is a `run_from` concern, not CLI
+                // stdout — discard it here.
                 self.run_from(args)?;
                 Ok(CliAction::Ran)
             }
@@ -1833,14 +1933,14 @@ impl Command {
         &'a self,
         matches: &'a Matches,
         root_matches: &'a Matches,
-    ) -> Result<(), RunError> {
+    ) -> Result<CommandOutput, RunError> {
         let context = CommandContext {
             command: self,
             matches,
             root_matches,
         };
 
-        let mut primary: Result<(), RunError> = Ok(());
+        let mut primary: Result<CommandOutput, RunError> = Ok(CommandOutput::new(()));
 
         for plugin in &self.plugins {
             if let Some(setup) = &plugin.setup
@@ -1895,7 +1995,7 @@ impl Command {
         matches: &'a Matches,
         root_matches: &'a Matches,
         context: &CommandContext<'a>,
-    ) -> Result<(), RunError> {
+    ) -> Result<CommandOutput, RunError> {
         if let Some(name) = matches.subcommand() {
             let child = self
                 .subcommands
@@ -1913,7 +2013,7 @@ impl Command {
         }
 
         if self.subcommands.is_empty() {
-            return Ok(());
+            return Ok(CommandOutput::new(()));
         }
 
         Err(RunError::NoCommand)
@@ -6107,7 +6207,7 @@ mod tests {
 
     #[test]
     fn handler_failure_becomes_handler_error_variant() {
-        let command = Command::new("root").handler(|_ctx| Err(Box::new(Boom) as BoxError));
+        let command = Command::new("root").handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError));
 
         let error = command.run_from([] as [&str; 0]).unwrap_err();
 
@@ -6116,7 +6216,7 @@ mod tests {
 
     #[test]
     fn handler_error_is_exposed_through_source() {
-        let command = Command::new("root").handler(|_ctx| Err(Box::new(Boom) as BoxError));
+        let command = Command::new("root").handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError));
 
         let error = command.run_from([] as [&str; 0]).unwrap_err();
 
@@ -6152,7 +6252,7 @@ mod tests {
                 *recorded.lock().unwrap() += 1;
                 Ok(())
             })
-            .command(Command::new("build").handler(|_ctx| {
+            .command(Command::new("build").handler(|_ctx| -> HandlerResult {
                 panic!("child handler must not run on parse failure");
             }));
 
@@ -6619,7 +6719,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let cleanup_calls = Arc::clone(&calls);
         let command = Command::new("root")
-            .handler(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError))
             .cleanup(move |_ctx| {
                 cleanup_calls.lock().unwrap().push("cleanup");
                 Ok(())
@@ -6634,7 +6734,7 @@ mod tests {
     #[test]
     fn handler_error_remains_primary_when_cleanup_also_fails() {
         let command = Command::new("root")
-            .handler(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError))
             .cleanup(|_ctx| Err(Box::new(Boom) as BoxError));
 
         let error = command.run_from([] as [&str; 0]).unwrap_err();
@@ -6713,7 +6813,9 @@ mod tests {
                 cleanup_calls.lock().unwrap().push("root-cleanup");
                 Ok(())
             })
-            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+            .command(
+                Command::new("build").handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError)),
+            );
 
         let error = command.run_from(["build"]).unwrap_err();
 
@@ -6725,7 +6827,9 @@ mod tests {
     fn child_error_remains_primary_when_parent_cleanup_fails() {
         let command = Command::new("root")
             .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
-            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+            .command(
+                Command::new("build").handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError)),
+            );
 
         let error = command.run_from(["build"]).unwrap_err();
 
@@ -7534,7 +7638,7 @@ mod tests {
                     .push("command-cleanup".to_string());
                 Ok(())
             })
-            .handler(|_ctx| Err(Box::new(Boom) as BoxError));
+            .handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError));
 
         command.run_from([] as [&str; 0]).unwrap_err();
 
@@ -7549,7 +7653,7 @@ mod tests {
         let command = Command::new("root")
             .plugin(failing_cleanup_plugin("a", &calls))
             .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
-            .handler(|_ctx| Err(Box::new(Boom) as BoxError));
+            .handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError));
 
         let error = command.run_from([] as [&str; 0]).unwrap_err();
 
@@ -7561,7 +7665,9 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let command = Command::new("root")
             .plugin(recording_plugin("root-a", &calls))
-            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+            .command(
+                Command::new("build").handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError)),
+            );
 
         command.run_from(["build"]).unwrap_err();
 
@@ -7578,7 +7684,9 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let command = Command::new("root")
             .plugin(failing_cleanup_plugin("root-a", &calls))
-            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+            .command(
+                Command::new("build").handler(|_ctx| Err::<(), _>(Box::new(Boom) as BoxError)),
+            );
 
         let error = command.run_from(["build"]).unwrap_err();
 
@@ -8425,5 +8533,261 @@ mod tests {
         let error = command.run_cli_from(["--bogus"]).unwrap_err();
 
         assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[derive(PartialEq, Debug)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    // Deliberately not Debug/Clone/Send/Sync, to prove CommandOutput
+    // imposes none of those bounds on the contained value.
+    struct NotDebugCloneSendSync(std::rc::Rc<std::cell::Cell<i32>>);
+
+    #[test]
+    fn command_output_unit() {
+        let output = CommandOutput::new(());
+
+        assert_eq!(output.downcast::<()>().unwrap(), ());
+    }
+
+    #[test]
+    fn command_output_usize() {
+        let output = CommandOutput::new(42usize);
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn command_output_string() {
+        let output = CommandOutput::new(String::from("done"));
+
+        assert_eq!(output.downcast::<String>().unwrap(), "done");
+    }
+
+    #[test]
+    fn command_output_custom_struct() {
+        let output = CommandOutput::new(Point { x: 1, y: 2 });
+
+        assert_eq!(output.downcast::<Point>().unwrap(), Point { x: 1, y: 2 });
+    }
+
+    #[test]
+    fn command_output_is_reports_contained_type() {
+        let output = CommandOutput::new(42usize);
+
+        assert!(output.is::<usize>());
+        assert!(!output.is::<String>());
+    }
+
+    #[test]
+    fn command_output_downcast_ref_reads_without_consuming() {
+        let output = CommandOutput::new(String::from("done"));
+
+        assert_eq!(output.downcast_ref::<String>().unwrap(), "done");
+        assert_eq!(output.downcast::<String>().unwrap(), "done");
+    }
+
+    #[test]
+    fn command_output_failed_downcast_preserves_output() {
+        let output = CommandOutput::new(42usize);
+
+        let output = output.downcast::<String>().unwrap_err();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn command_output_type_name() {
+        let output = CommandOutput::new(42usize);
+
+        assert_eq!(output.type_name(), std::any::type_name::<usize>());
+    }
+
+    #[test]
+    fn command_output_debug_does_not_require_inner_debug() {
+        let cell = std::rc::Rc::new(std::cell::Cell::new(7));
+        let output = CommandOutput::new(NotDebugCloneSendSync(cell));
+
+        let rendered = format!("{output:?}");
+
+        assert!(rendered.contains("CommandOutput"));
+        assert!(rendered.contains("type_name"));
+        let value = output.downcast::<NotDebugCloneSendSync>().unwrap();
+        assert_eq!(value.0.get(), 7);
+    }
+
+    #[test]
+    fn root_handler_result_is_returned() {
+        let command = Command::new("root").handler(|_ctx| Ok(42usize));
+
+        let output = command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn captured_closure_handler_returns_value() {
+        let prefix = String::from("hello, ");
+        let command =
+            Command::new("root").handler(move |_ctx| Ok::<_, BoxError>(format!("{prefix}world")));
+
+        let output = command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(output.downcast::<String>().unwrap(), "hello, world");
+    }
+
+    #[test]
+    fn cloned_command_retains_result_producing_handler() {
+        let command = Command::new("root").handler(|_ctx| Ok(42usize));
+        let cloned = command.clone();
+
+        let output = cloned.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn explicit_child_result_propagates() {
+        let command =
+            Command::new("root").command(Command::new("child").handler(|_ctx| Ok(42usize)));
+
+        let output = command.run_from(["child"]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn aliased_child_result_propagates() {
+        let command = Command::new("root")
+            .command(Command::new("child").alias("c").handler(|_ctx| Ok(42usize)));
+
+        let output = command.run_from(["c"]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn default_child_result_propagates() {
+        let command = Command::new("root")
+            .default_subcommand("child")
+            .command(Command::new("child").handler(|_ctx| Ok(42usize)));
+
+        let output = command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn hidden_child_result_propagates() {
+        let command = Command::new("root")
+            .command(Command::new("secret").hidden().handler(|_ctx| Ok(42usize)));
+
+        let output = command.run_from(["secret"]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn deep_nested_child_result_propagates() {
+        let command = Command::new("root")
+            .command(Command::new("mid").command(Command::new("leaf").handler(|_ctx| Ok(42usize))));
+
+        let output = command.run_from(["mid", "leaf"]).unwrap();
+
+        assert_eq!(output.downcast::<usize>().unwrap(), 42);
+    }
+
+    #[test]
+    fn empty_no_handler_command_returns_unit_output() {
+        let command = Command::new("root");
+
+        let output = command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(output.downcast::<()>().unwrap(), ());
+    }
+
+    #[test]
+    fn handlerless_selected_leaf_returns_unit_output() {
+        let command = Command::new("root").command(Command::new("child"));
+
+        let output = command.run_from(["child"]).unwrap();
+
+        assert_eq!(output.downcast::<()>().unwrap(), ());
+    }
+
+    #[test]
+    fn typed_handler_error_still_run_error_handler() {
+        let command =
+            Command::new("root").handler(|_ctx| Err::<usize, _>(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+    }
+
+    #[test]
+    fn setup_failure_produces_no_successful_output() {
+        let command = Command::new("root")
+            .setup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Ok(42usize));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Setup(_)));
+    }
+
+    #[test]
+    fn plugin_setup_failure_produces_no_successful_output() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("p").setup(|_ctx| Err(Box::new(Boom) as BoxError)))
+            .handler(|_ctx| Ok(42usize));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::PluginSetup { .. }));
+    }
+
+    #[test]
+    fn command_cleanup_failure_overrides_successful_output() {
+        let command = Command::new("root")
+            .handler(|_ctx| Ok(42usize))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Cleanup(_)));
+    }
+
+    #[test]
+    fn plugin_cleanup_failure_overrides_successful_output() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("p").cleanup(|_ctx| Err(Box::new(Boom) as BoxError)))
+            .handler(|_ctx| Ok(42usize));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::PluginCleanup { .. }));
+    }
+
+    #[test]
+    fn nested_parent_cleanup_failure_overrides_leaf_output() {
+        let command = Command::new("root")
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .command(Command::new("child").handler(|_ctx| Ok(42usize)));
+
+        let error = command.run_from(["child"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Cleanup(_)));
+    }
+
+    #[test]
+    fn cli_dispatcher_discards_handler_output() {
+        let command = Command::new("ritty").handler(|_ctx| Ok(42usize));
+
+        let action = command.run_cli_from([] as [&str; 0]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
     }
 }
