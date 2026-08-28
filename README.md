@@ -5,6 +5,8 @@ provides a synchronous, builder-oriented API for nested commands, arguments and
 options, execution, lifecycle hooks, plugins, and lazy subcommands. Ritty uses
 Rust 2024 and has zero runtime dependencies.
 
+Repository: https://github.com/adezdev/ritty
+
 ## Features
 
 - Positional arguments, boolean flags, string options, and enum options
@@ -17,16 +19,10 @@ Rust 2024 and has zero runtime dependencies.
 
 ## Installation
 
-Ritty is not currently published on crates.io. From a local repository checkout,
-use a path dependency:
-
 ```toml
 [dependencies]
-ritty = { path = "../ritty" }
+ritty = "0.1.0"
 ```
-
-Adjust the path to the location of the checkout. No crates.io release channel is
-available yet.
 
 ## Quick start
 
@@ -396,11 +392,14 @@ Ritty ports Citty's useful concepts to idiomatic synchronous Rust rather than
 translating JavaScript mechanics literally. The most visible deliberate
 differences include strict lowercase `true`/`false` boolean values, strict
 missing string/enum values, selected-leaf `CommandOutput` propagation, and
-synchronous cached lazy subcommands. See [CITTY_PARITY.md](CITTY_PARITY.md) for
-the detailed parity and divergence record.
+synchronous cached lazy subcommands.
 
 ## Status
 
 Ritty is pre-1.0. The current Citty-parity implementation is complete, but the
-public API may still evolve before 1.0. Ritty has not been published to
-crates.io.
+public API may still evolve before 1.0.
+
+## License
+
+Ritty is dual-licensed under MIT OR Apache-2.0. See
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
