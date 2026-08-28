@@ -4,6 +4,8 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg {
     name: String,
+    description: Option<String>,
+    value_hint: Option<String>,
     required: bool,
     default: Option<String>,
 }
@@ -13,9 +15,23 @@ impl Arg {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            description: None,
+            value_hint: None,
             required: false,
             default: None,
         }
+    }
+
+    /// Sets the argument description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Sets the argument's value hint, for usage rendering.
+    pub fn value_hint(mut self, value_hint: impl Into<String>) -> Self {
+        self.value_hint = Some(value_hint.into());
+        self
     }
 
     /// Marks the argument as required.
@@ -43,6 +59,16 @@ impl Arg {
     /// Returns the argument's default value, if any.
     pub fn default_value(&self) -> Option<&str> {
         self.default.as_deref()
+    }
+
+    /// Returns the argument description.
+    pub fn get_description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Returns the argument's value hint.
+    pub fn get_value_hint(&self) -> Option<&str> {
+        self.value_hint.as_deref()
     }
 }
 
@@ -501,6 +527,42 @@ mod tests {
 
         assert_eq!(matches.subcommand(), Some("build"));
         assert_eq!(matches.argument("name"), Some("world"));
+    }
+
+    #[test]
+    fn argument_metadata_defaults_to_none() {
+        let arg = Arg::new("name");
+
+        assert_eq!(arg.get_description(), None);
+        assert_eq!(arg.get_value_hint(), None);
+    }
+
+    #[test]
+    fn configures_argument_metadata() {
+        let arg = Arg::new("output")
+            .description("Output directory")
+            .value_hint("dir")
+            .required()
+            .default(".");
+
+        assert_eq!(arg.name(), "output");
+        assert_eq!(arg.get_description(), Some("Output directory"));
+        assert_eq!(arg.get_value_hint(), Some("dir"));
+        assert!(arg.is_required());
+        assert_eq!(arg.default_value(), Some("."));
+    }
+
+    #[test]
+    fn argument_metadata_does_not_affect_parsing() {
+        let command = Command::new("ritty").arg(
+            Arg::new("output")
+                .description("Output directory")
+                .value_hint("dir"),
+        );
+
+        let matches = command.parse_from(["build"]).unwrap();
+
+        assert_eq!(matches.argument("output"), Some("build"));
     }
 
     #[test]
