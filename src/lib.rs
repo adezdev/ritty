@@ -981,6 +981,24 @@ pub enum RunError {
     /// A command's cleanup hook returned an error, and no earlier setup,
     /// handler, or nested-execution failure took precedence over it.
     Cleanup(BoxError),
+    /// A plugin's setup hook returned an error. Later plugin setups, the
+    /// command's own setup, and its work are skipped, but command cleanup
+    /// and every registered plugin's cleanup still run.
+    PluginSetup {
+        /// The failing plugin's name.
+        plugin: String,
+        /// The original error returned by the plugin's setup hook.
+        source: BoxError,
+    },
+    /// A plugin's cleanup hook returned an error, and no earlier setup,
+    /// handler, nested-execution, or command-cleanup failure took
+    /// precedence over it.
+    PluginCleanup {
+        /// The failing plugin's name.
+        plugin: String,
+        /// The original error returned by the plugin's cleanup hook.
+        source: BoxError,
+    },
 }
 
 impl std::fmt::Display for RunError {
@@ -991,6 +1009,12 @@ impl std::fmt::Display for RunError {
             RunError::Setup(err) => write!(f, "{err}"),
             RunError::Handler(err) => write!(f, "{err}"),
             RunError::Cleanup(err) => write!(f, "{err}"),
+            RunError::PluginSetup { plugin, source } => {
+                write!(f, "plugin {plugin} setup failed: {source}")
+            }
+            RunError::PluginCleanup { plugin, source } => {
+                write!(f, "plugin {plugin} cleanup failed: {source}")
+            }
         }
     }
 }
@@ -1003,6 +1027,8 @@ impl std::error::Error for RunError {
             RunError::Setup(err) => Some(err.as_ref()),
             RunError::Handler(err) => Some(err.as_ref()),
             RunError::Cleanup(err) => Some(err.as_ref()),
+            RunError::PluginSetup { source, .. } => Some(source.as_ref()),
+            RunError::PluginCleanup { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -1010,6 +1036,68 @@ impl std::error::Error for RunError {
 impl From<ParseError> for RunError {
     fn from(err: ParseError) -> Self {
         RunError::Parse(err)
+    }
+}
+
+/// A reusable, named lifecycle participant attached to a `Command` via
+/// [`Command::plugin`]. A plugin has no handler of its own — it only
+/// contributes setup/cleanup hooks that run alongside the command's own
+/// lifecycle. See [`Command::plugin`] for exact ordering.
+///
+/// A `Plugin` is a concrete, cloneable value: because its hooks are backed
+/// by the same `Arc`-wrapped `Hook` used elsewhere, cloning a plugin to
+/// attach it to multiple commands shares its captured closure state rather
+/// than duplicating it.
+#[derive(Debug, Clone)]
+pub struct Plugin {
+    name: String,
+    setup: Option<Hook>,
+    cleanup: Option<Hook>,
+}
+
+impl Plugin {
+    /// Creates a new named plugin with no setup or cleanup hooks.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            setup: None,
+            cleanup: None,
+        }
+    }
+
+    /// Returns the plugin's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Sets the plugin's setup hook, run as part of the owning command's
+    /// setup phase. Ordinary captured closures are supported.
+    pub fn setup<F>(mut self, setup: F) -> Self
+    where
+        F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
+    {
+        self.setup = Some(Hook(Arc::new(setup)));
+        self
+    }
+
+    /// Returns whether the plugin has a setup hook set.
+    pub fn has_setup(&self) -> bool {
+        self.setup.is_some()
+    }
+
+    /// Sets the plugin's cleanup hook, run as part of the owning command's
+    /// cleanup phase. Ordinary captured closures are supported.
+    pub fn cleanup<F>(mut self, cleanup: F) -> Self
+    where
+        F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
+    {
+        self.cleanup = Some(Hook(Arc::new(cleanup)));
+        self
+    }
+
+    /// Returns whether the plugin has a cleanup hook set.
+    pub fn has_cleanup(&self) -> bool {
+        self.cleanup.is_some()
     }
 }
 
@@ -1029,6 +1117,7 @@ pub struct Command {
     handler: Option<Hook>,
     setup: Option<Hook>,
     cleanup: Option<Hook>,
+    plugins: Vec<Plugin>,
 }
 
 impl Command {
@@ -1049,6 +1138,7 @@ impl Command {
             handler: None,
             setup: None,
             cleanup: None,
+            plugins: Vec::new(),
         }
     }
 
@@ -1101,6 +1191,36 @@ impl Command {
     /// Returns whether the command has a cleanup hook set.
     pub fn has_cleanup(&self) -> bool {
         self.cleanup.is_some()
+    }
+
+    /// Attaches a plugin to the command. Repeated calls append; declaration
+    /// order determines setup order (and, reversed, cleanup order). Plugins
+    /// are not deduplicated by name — two plugins sharing a name are kept as
+    /// distinct entries.
+    ///
+    /// Lifecycle order for one command:
+    ///
+    /// ```text
+    /// plugin setups (declaration order)
+    /// → command setup
+    /// → selected work (handler or child)
+    /// → command cleanup
+    /// → plugin cleanups (reverse declaration order)
+    /// ```
+    ///
+    /// If a plugin's setup fails, later plugin setups and the command's own
+    /// setup/work are skipped — but command cleanup and every registered
+    /// plugin's cleanup are still attempted, including plugins whose setup
+    /// never ran. The first failure established (setup or cleanup) remains
+    /// the primary `RunError`; later cleanup failures never replace it.
+    pub fn plugin(mut self, plugin: Plugin) -> Self {
+        self.plugins.push(plugin);
+        self
+    }
+
+    /// Returns the command's attached plugins, in declaration order.
+    pub fn plugins(&self) -> &[Plugin] {
+        &self.plugins
     }
 
     /// Marks the command as hidden from generated usage/help listings.
@@ -1472,11 +1592,13 @@ impl Command {
     /// Executes the command selected by `matches`, recursing into a selected
     /// child by its canonical name rather than re-resolving aliases.
     ///
-    /// Setup runs before entering a selected child or invoking this
+    /// Plugin setups (declaration order) run before this command's own
+    /// setup, which runs before entering a selected child or invoking this
     /// command's own handler (root-to-leaf along the selected path); cleanup
-    /// is always attempted afterward, even if setup, the child, or the
-    /// handler failed (leaf-to-root). A cleanup failure never overwrites an
-    /// earlier primary failure.
+    /// is always attempted afterward, even if plugin setup, setup, the
+    /// child, or the handler failed — command cleanup first, then plugin
+    /// cleanups in reverse declaration order (leaf-to-root across nesting).
+    /// A cleanup failure never overwrites an earlier primary failure.
     fn execute<'a>(
         &'a self,
         matches: &'a Matches,
@@ -1490,7 +1612,20 @@ impl Command {
 
         let mut primary: Result<(), RunError> = Ok(());
 
-        if let Some(setup) = &self.setup
+        for plugin in &self.plugins {
+            if let Some(setup) = &plugin.setup
+                && let Err(err) = (setup.0)(&context)
+            {
+                primary = Err(RunError::PluginSetup {
+                    plugin: plugin.name.clone(),
+                    source: err,
+                });
+                break;
+            }
+        }
+
+        if primary.is_ok()
+            && let Some(setup) = &self.setup
             && let Err(err) = (setup.0)(&context)
         {
             primary = Err(RunError::Setup(err));
@@ -1505,6 +1640,18 @@ impl Command {
             && primary.is_ok()
         {
             primary = Err(RunError::Cleanup(err));
+        }
+
+        for plugin in self.plugins.iter().rev() {
+            if let Some(cleanup) = &plugin.cleanup
+                && let Err(err) = (cleanup.0)(&context)
+                && primary.is_ok()
+            {
+                primary = Err(RunError::PluginCleanup {
+                    plugin: plugin.name.clone(),
+                    source: err,
+                });
+            }
         }
 
         primary
@@ -6474,5 +6621,838 @@ mod tests {
 
         let source = std::error::Error::source(&error).expect("cleanup error has a source");
         assert_eq!(source.to_string(), "boom");
+    }
+
+    // --- plugins ---
+
+    fn recording_plugin(name: &str, log: &Arc<Mutex<Vec<String>>>) -> Plugin {
+        let setup_log = Arc::clone(log);
+        let cleanup_log = Arc::clone(log);
+        let setup_tag = format!("{name}-setup");
+        let cleanup_tag = format!("{name}-cleanup");
+        Plugin::new(name)
+            .setup(move |_ctx| {
+                setup_log.lock().unwrap().push(setup_tag.clone());
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_log.lock().unwrap().push(cleanup_tag.clone());
+                Ok(())
+            })
+    }
+
+    fn failing_setup_plugin(name: &str, log: &Arc<Mutex<Vec<String>>>) -> Plugin {
+        let setup_log = Arc::clone(log);
+        let setup_tag = format!("{name}-setup");
+        Plugin::new(name).setup(move |_ctx| {
+            setup_log.lock().unwrap().push(setup_tag.clone());
+            Err(Box::new(Boom) as BoxError)
+        })
+    }
+
+    fn failing_cleanup_plugin(name: &str, log: &Arc<Mutex<Vec<String>>>) -> Plugin {
+        let cleanup_log = Arc::clone(log);
+        let cleanup_tag = format!("{name}-cleanup");
+        Plugin::new(name).cleanup(move |_ctx| {
+            cleanup_log.lock().unwrap().push(cleanup_tag.clone());
+            Err(Box::new(Boom) as BoxError)
+        })
+    }
+
+    #[test]
+    fn new_plugin_stores_name() {
+        assert_eq!(Plugin::new("logger").name(), "logger");
+    }
+
+    #[test]
+    fn new_plugin_has_no_setup() {
+        assert!(!Plugin::new("logger").has_setup());
+    }
+
+    #[test]
+    fn new_plugin_has_no_cleanup() {
+        assert!(!Plugin::new("logger").has_cleanup());
+    }
+
+    #[test]
+    fn plugin_setup_builder_sets_has_setup() {
+        let plugin = Plugin::new("logger").setup(|_ctx| Ok(()));
+        assert!(plugin.has_setup());
+        assert!(!plugin.has_cleanup());
+    }
+
+    #[test]
+    fn plugin_cleanup_builder_sets_has_cleanup() {
+        let plugin = Plugin::new("logger").cleanup(|_ctx| Ok(()));
+        assert!(plugin.has_cleanup());
+        assert!(!plugin.has_setup());
+    }
+
+    #[test]
+    fn command_starts_with_zero_plugins() {
+        assert!(Command::new("root").plugins().is_empty());
+    }
+
+    #[test]
+    fn plugin_appends() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("a"))
+            .plugin(Plugin::new("b"));
+        assert_eq!(command.plugins().len(), 2);
+    }
+
+    #[test]
+    fn plugins_preserve_declaration_order() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("a"))
+            .plugin(Plugin::new("b"))
+            .plugin(Plugin::new("c"));
+        let names: Vec<&str> = command.plugins().iter().map(Plugin::name).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn duplicate_plugin_names_remain_distinct_entries() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("logger"))
+            .plugin(Plugin::new("logger"));
+        assert_eq!(command.plugins().len(), 2);
+    }
+
+    #[test]
+    fn captured_plugin_setup_closure_runs() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("logger", &calls))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert!(calls.lock().unwrap().contains(&"logger-setup".to_string()));
+    }
+
+    #[test]
+    fn captured_plugin_cleanup_closure_runs() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("logger", &calls))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&"logger-cleanup".to_string())
+        );
+    }
+
+    #[test]
+    fn cloned_plugin_retains_hooks() {
+        let plugin = Plugin::new("logger")
+            .setup(|_ctx| Ok(()))
+            .cleanup(|_ctx| Ok(()));
+        let cloned = plugin.clone();
+        assert!(cloned.has_setup());
+        assert!(cloned.has_cleanup());
+        assert_eq!(cloned.name(), "logger");
+    }
+
+    #[test]
+    fn cloned_command_retains_attached_plugins() {
+        let command = Command::new("root").plugin(Plugin::new("logger"));
+        let cloned = command.clone();
+        assert_eq!(cloned.plugins().len(), 1);
+        assert_eq!(cloned.plugins()[0].name(), "logger");
+    }
+
+    #[test]
+    fn same_cloned_plugin_can_attach_to_two_commands() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let logger = recording_plugin("logger", &calls);
+
+        let a = Command::new("a")
+            .plugin(logger.clone())
+            .handler(|_ctx| Ok(()));
+        let b = Command::new("b").plugin(logger).handler(|_ctx| Ok(()));
+
+        a.run_from([] as [&str; 0]).unwrap();
+        b.run_from([] as [&str; 0]).unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|c| c.as_str() == "logger-setup")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn single_plugin_setup_runs_before_command_setup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .setup(move |_ctx| {
+                setup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-setup".to_string());
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        let recorded = calls.lock().unwrap();
+        let setup_index = recorded.iter().position(|c| c == "a-setup").unwrap();
+        let command_index = recorded.iter().position(|c| c == "command-setup").unwrap();
+        assert!(setup_index < command_index);
+    }
+
+    #[test]
+    fn multiple_plugin_setups_run_in_declaration_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .plugin(recording_plugin("b", &calls))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded[0], "a-setup");
+        assert_eq!(recorded[1], "b-setup");
+    }
+
+    #[test]
+    fn command_setup_runs_after_all_successful_plugin_setups() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .plugin(recording_plugin("b", &calls))
+            .setup(move |_ctx| {
+                setup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-setup".to_string());
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded[0], "a-setup");
+        assert_eq!(recorded[1], "b-setup");
+        assert_eq!(recorded[2], "command-setup");
+    }
+
+    #[test]
+    fn command_cleanup_runs_before_plugin_cleanups() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .cleanup(move |_ctx| {
+                cleanup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-cleanup".to_string());
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        let recorded = calls.lock().unwrap();
+        let command_index = recorded
+            .iter()
+            .position(|c| c == "command-cleanup")
+            .unwrap();
+        let plugin_index = recorded.iter().position(|c| c == "a-cleanup").unwrap();
+        assert!(command_index < plugin_index);
+    }
+
+    #[test]
+    fn multiple_plugin_cleanups_run_reverse_declaration_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .plugin(recording_plugin("b", &calls))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        let recorded = calls.lock().unwrap();
+        let cleanups: Vec<&String> = recorded
+            .iter()
+            .filter(|c| c.ends_with("-cleanup"))
+            .collect();
+        assert_eq!(cleanups, vec!["b-cleanup", "a-cleanup"]);
+    }
+
+    #[test]
+    fn complete_success_order_plugin_command_handler_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let handler_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .plugin(recording_plugin("b", &calls))
+            .setup(move |_ctx| {
+                setup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-setup".to_string());
+                Ok(())
+            })
+            .handler(move |_ctx| {
+                handler_calls.lock().unwrap().push("handler".to_string());
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-cleanup".to_string());
+                Ok(())
+            });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "a-setup",
+                "b-setup",
+                "command-setup",
+                "handler",
+                "command-cleanup",
+                "b-cleanup",
+                "a-cleanup",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_plugin_lifecycle_ordering() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_setup = Arc::clone(&calls);
+        let root_cleanup = Arc::clone(&calls);
+        let child_setup = Arc::clone(&calls);
+        let child_cleanup = Arc::clone(&calls);
+        let leaf_setup = Arc::clone(&calls);
+        let leaf_handler = Arc::clone(&calls);
+        let leaf_cleanup = Arc::clone(&calls);
+
+        let command = Command::new("root")
+            .plugin(recording_plugin("root-a", &calls))
+            .plugin(recording_plugin("root-b", &calls))
+            .setup(move |_ctx| {
+                root_setup.lock().unwrap().push("root-setup".to_string());
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                root_cleanup
+                    .lock()
+                    .unwrap()
+                    .push("root-cleanup".to_string());
+                Ok(())
+            })
+            .command(
+                Command::new("child")
+                    .plugin(recording_plugin("child-a", &calls))
+                    .plugin(recording_plugin("child-b", &calls))
+                    .setup(move |_ctx| {
+                        child_setup.lock().unwrap().push("child-setup".to_string());
+                        Ok(())
+                    })
+                    .cleanup(move |_ctx| {
+                        child_cleanup
+                            .lock()
+                            .unwrap()
+                            .push("child-cleanup".to_string());
+                        Ok(())
+                    })
+                    .command(
+                        Command::new("leaf")
+                            .plugin(recording_plugin("leaf-a", &calls))
+                            .plugin(recording_plugin("leaf-b", &calls))
+                            .setup(move |_ctx| {
+                                leaf_setup.lock().unwrap().push("leaf-setup".to_string());
+                                Ok(())
+                            })
+                            .handler(move |_ctx| {
+                                leaf_handler
+                                    .lock()
+                                    .unwrap()
+                                    .push("leaf-handler".to_string());
+                                Ok(())
+                            })
+                            .cleanup(move |_ctx| {
+                                leaf_cleanup
+                                    .lock()
+                                    .unwrap()
+                                    .push("leaf-cleanup".to_string());
+                                Ok(())
+                            }),
+                    ),
+            );
+
+        command.run_from(["child", "leaf"]).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "root-a-setup",
+                "root-b-setup",
+                "root-setup",
+                "child-a-setup",
+                "child-b-setup",
+                "child-setup",
+                "leaf-a-setup",
+                "leaf-b-setup",
+                "leaf-setup",
+                "leaf-handler",
+                "leaf-cleanup",
+                "leaf-b-cleanup",
+                "leaf-a-cleanup",
+                "child-cleanup",
+                "child-b-cleanup",
+                "child-a-cleanup",
+                "root-cleanup",
+                "root-b-cleanup",
+                "root-a-cleanup",
+            ]
+        );
+    }
+
+    #[test]
+    fn parent_handlers_remain_suppressed_with_plugins() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let parent_handler = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(recording_plugin("root-a", &calls))
+            .handler(move |_ctx| {
+                parent_handler
+                    .lock()
+                    .unwrap()
+                    .push("root-handler".to_string());
+                Ok(())
+            })
+            .command(Command::new("child").handler(|_ctx| Ok(())));
+
+        command.run_from(["child"]).unwrap();
+
+        assert!(!calls.lock().unwrap().contains(&"root-handler".to_string()));
+    }
+
+    #[test]
+    fn handlerless_intermediate_command_plugins_run() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("root-a", &calls))
+            .command(Command::new("child").handler(|_ctx| Ok(())));
+
+        command.run_from(["child"]).unwrap();
+
+        assert!(calls.lock().unwrap().contains(&"root-a-setup".to_string()));
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&"root-a-cleanup".to_string())
+        );
+    }
+
+    #[test]
+    fn alias_selected_child_plugin_lifecycle() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root").command(
+            Command::new("child")
+                .alias("c")
+                .plugin(recording_plugin("child-a", &calls))
+                .handler(|_ctx| Ok(())),
+        );
+
+        command.run_from(["c"]).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["child-a-setup", "child-a-cleanup"]
+        );
+    }
+
+    #[test]
+    fn default_child_plugin_lifecycle() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root").default_subcommand("child").command(
+            Command::new("child")
+                .plugin(recording_plugin("child-a", &calls))
+                .handler(|_ctx| Ok(())),
+        );
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["child-a-setup", "child-a-cleanup"]
+        );
+    }
+
+    #[test]
+    fn hidden_child_plugin_lifecycle() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root").command(
+            Command::new("secret")
+                .hidden()
+                .plugin(recording_plugin("secret-a", &calls))
+                .handler(|_ctx| Ok(())),
+        );
+
+        command.run_from(["secret"]).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["secret-a-setup", "secret-a-cleanup"]
+        );
+    }
+
+    #[test]
+    fn parse_failure_runs_zero_plugin_callbacks() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from(["--wat"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn plugin_setup_failure_prevents_later_plugin_setups() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .plugin(failing_setup_plugin("b", &calls))
+            .plugin(recording_plugin("c", &calls))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(!calls.lock().unwrap().contains(&"c-setup".to_string()));
+    }
+
+    #[test]
+    fn plugin_setup_failure_prevents_command_setup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(failing_setup_plugin("a", &calls))
+            .setup(move |_ctx| {
+                setup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-setup".to_string());
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(!calls.lock().unwrap().contains(&"command-setup".to_string()));
+    }
+
+    #[test]
+    fn plugin_setup_failure_prevents_handler() {
+        let calls = Arc::new(Mutex::new(0));
+        let recorded = Arc::clone(&calls);
+        let plugin_calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_setup_plugin("a", &plugin_calls))
+            .handler(move |_ctx| {
+                *recorded.lock().unwrap() += 1;
+                Ok(())
+            });
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn command_cleanup_runs_after_plugin_setup_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(failing_setup_plugin("a", &calls))
+            .cleanup(move |_ctx| {
+                cleanup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-cleanup".to_string());
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&"command-cleanup".to_string())
+        );
+    }
+
+    #[test]
+    fn all_plugin_cleanups_run_after_plugin_setup_failure_including_not_yet_setup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .plugin(failing_setup_plugin("b", &calls))
+            .plugin(recording_plugin("c", &calls))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.contains(&"c-cleanup".to_string()));
+        assert!(recorded.contains(&"a-cleanup".to_string()));
+        let cleanups: Vec<&String> = recorded
+            .iter()
+            .filter(|c| c.ends_with("-cleanup"))
+            .collect();
+        assert_eq!(cleanups, vec!["c-cleanup", "a-cleanup"]);
+    }
+
+    #[test]
+    fn plugin_setup_error_remains_primary_when_command_cleanup_fails() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("a").setup(|_ctx| Err(Box::new(Boom) as BoxError)))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::PluginSetup { .. }));
+    }
+
+    #[test]
+    fn plugin_setup_error_remains_primary_when_plugin_cleanup_fails() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_setup_plugin("a", &calls))
+            .plugin(failing_cleanup_plugin("b", &calls))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::PluginSetup { plugin, .. } if plugin == "a"));
+    }
+
+    #[test]
+    fn command_setup_failure_still_runs_reverse_plugin_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .plugin(recording_plugin("b", &calls))
+            .setup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        let recorded = calls.lock().unwrap();
+        let cleanups: Vec<&String> = recorded
+            .iter()
+            .filter(|c| c.ends_with("-cleanup"))
+            .collect();
+        assert_eq!(cleanups, vec!["b-cleanup", "a-cleanup"]);
+    }
+
+    #[test]
+    fn command_setup_error_remains_primary_over_plugin_cleanup_errors() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_cleanup_plugin("a", &calls))
+            .setup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Setup(_)));
+    }
+
+    #[test]
+    fn handler_failure_still_runs_command_and_plugin_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .plugin(recording_plugin("a", &calls))
+            .cleanup(move |_ctx| {
+                cleanup_calls
+                    .lock()
+                    .unwrap()
+                    .push("command-cleanup".to_string());
+                Ok(())
+            })
+            .handler(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.contains(&"command-cleanup".to_string()));
+        assert!(recorded.contains(&"a-cleanup".to_string()));
+    }
+
+    #[test]
+    fn handler_error_remains_primary_with_plugins() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_cleanup_plugin("a", &calls))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+    }
+
+    #[test]
+    fn child_failure_still_causes_parent_plugin_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(recording_plugin("root-a", &calls))
+            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+
+        command.run_from(["build"]).unwrap_err();
+
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&"root-a-cleanup".to_string())
+        );
+    }
+
+    #[test]
+    fn child_failure_remains_primary_with_plugins() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_cleanup_plugin("root-a", &calls))
+            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+
+        let error = command.run_from(["build"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+    }
+
+    #[test]
+    fn command_cleanup_error_takes_precedence_over_later_plugin_cleanup_failures() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_cleanup_plugin("a", &calls))
+            .plugin(failing_cleanup_plugin("b", &calls))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Cleanup(_)));
+        // both plugin cleanups still attempted despite command cleanup already failing
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.contains(&"a-cleanup".to_string()));
+        assert!(recorded.contains(&"b-cleanup".to_string()));
+    }
+
+    #[test]
+    fn plugin_cleanup_only_failure_becomes_typed_plugin_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_cleanup_plugin("a", &calls))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::PluginCleanup { .. }));
+    }
+
+    #[test]
+    fn first_reverse_order_plugin_cleanup_failure_wins() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_cleanup_plugin("a", &calls))
+            .plugin(failing_cleanup_plugin("b", &calls))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::PluginCleanup { plugin, .. } if plugin == "b"));
+    }
+
+    #[test]
+    fn later_plugin_cleanup_hooks_still_run_after_a_plugin_cleanup_error() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let command = Command::new("root")
+            .plugin(failing_cleanup_plugin("a", &calls))
+            .plugin(failing_cleanup_plugin("b", &calls))
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap_err();
+
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.contains(&"a-cleanup".to_string()));
+        assert!(recorded.contains(&"b-cleanup".to_string()));
+    }
+
+    #[test]
+    fn plugin_setup_exposes_source() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("a").setup(|_ctx| Err(Box::new(Boom) as BoxError)))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        let source = std::error::Error::source(&error).expect("plugin setup error has a source");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn plugin_cleanup_exposes_source() {
+        let command = Command::new("root")
+            .plugin(Plugin::new("a").cleanup(|_ctx| Err(Box::new(Boom) as BoxError)))
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        let source = std::error::Error::source(&error).expect("plugin cleanup error has a source");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn plugin_identity_retained_in_both_typed_errors() {
+        let setup_error = Command::new("root")
+            .plugin(Plugin::new("logger").setup(|_ctx| Err(Box::new(Boom) as BoxError)))
+            .handler(|_ctx| Ok(()))
+            .run_from([] as [&str; 0])
+            .unwrap_err();
+        assert!(matches!(setup_error, RunError::PluginSetup { plugin, .. } if plugin == "logger"));
+
+        let cleanup_error = Command::new("root")
+            .plugin(Plugin::new("logger").cleanup(|_ctx| Err(Box::new(Boom) as BoxError)))
+            .handler(|_ctx| Ok(()))
+            .run_from([] as [&str; 0])
+            .unwrap_err();
+        assert!(
+            matches!(cleanup_error, RunError::PluginCleanup { plugin, .. } if plugin == "logger")
+        );
     }
 }
