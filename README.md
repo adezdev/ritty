@@ -394,11 +394,6 @@ differences include strict lowercase `true`/`false` boolean values, strict
 missing string/enum values, selected-leaf `CommandOutput` propagation, and
 synchronous cached lazy subcommands.
 
-## Status
-
-Ritty is pre-1.0. The current Citty-parity implementation is complete, but the
-public API may still evolve before 1.0.
-
 ## License
 
 Ritty is dual-licensed under MIT OR Apache-2.0. See
