@@ -526,8 +526,12 @@ enum OptionArity {
     Value,
 }
 
-/// A resolved CLI-facing built-in request, or none (fall through to ordinary
-/// execution). Produced by `Command::resolve_builtin`.
+/// A resolved CLI-facing help request, or none (fall through to version
+/// detection, then ordinary execution). Produced by `Command::resolve_help`.
+///
+/// Version is not part of this tree walk: per Citty, automatic version is a
+/// root-only, single-token request, checked separately by `run_cli_from`
+/// after confirming no help request matched anywhere in argv.
 enum Builtin<'a> {
     /// A help request targeting `command`, reachable from the root as
     /// `display_name` (space-separated, canonical names only).
@@ -536,9 +540,6 @@ enum Builtin<'a> {
         display_name: String,
         inherited_version: Option<&'a str>,
     },
-    /// A version request; `None` when the resolved command has no version
-    /// of its own and inherits none from an ancestor.
-    Version(Option<&'a str>),
     /// No built-in was requested.
     None,
 }
@@ -1657,13 +1658,17 @@ impl Command {
     }
 
     /// Walks `args` against this command tree looking for a built-in
-    /// `--help`/`-h`/`--version`/`-v` request, without running the ordinary
-    /// parser (which would reject an undeclared `--help`/`--version` as an
-    /// unknown option). Reuses `probe_long`/`probe_short`'s option-arity
-    /// knowledge to skip over parent option values correctly, and follows
-    /// only explicit subcommand tokens — never a default-subcommand chain —
-    /// so a bare `--help` never silently targets a default child.
-    fn resolve_builtin<'a>(&'a self, args: &[String]) -> Result<Builtin<'a>, ParseError> {
+    /// `--help`/`-h` request, without running the ordinary parser (which
+    /// would reject an undeclared `--help` as an unknown option). Reuses
+    /// `probe_long`/`probe_short`'s option-arity knowledge to skip over
+    /// parent option values correctly, and follows only explicit subcommand
+    /// tokens — never a default-subcommand chain — so a bare `--help` never
+    /// silently targets a default child.
+    ///
+    /// Version is not resolved here: Citty's automatic version is a
+    /// root-only, single-token request, evaluated by `run_cli_from` only
+    /// after this walk finds no help request.
+    fn resolve_help<'a>(&'a self, args: &[String]) -> Result<Builtin<'a>, ParseError> {
         let mut command = self;
         let mut display_name = self.name().to_owned();
         let mut inherited_version: Option<&'a str> = None;
@@ -1698,18 +1703,6 @@ impl Command {
                     display_name,
                     inherited_version,
                 });
-            }
-
-            if arg == "--version" && command.builtin_long_enabled("version") {
-                return Ok(Builtin::Version(
-                    command.version.as_deref().or(inherited_version),
-                ));
-            }
-
-            if arg == "-v" && command.builtin_short_enabled("version", 'v') {
-                return Ok(Builtin::Version(
-                    command.version.as_deref().or(inherited_version),
-                ));
             }
 
             if let Some(rest) = arg.strip_prefix("--") {
@@ -1757,10 +1750,23 @@ impl Command {
         Ok(Builtin::None)
     }
 
+    /// Whether `token` is this (root) command's enabled automatic-version
+    /// spelling. Only meaningful as the sole element of argv — see
+    /// `run_cli_from`.
+    fn builtin_version_token(&self, token: &str) -> bool {
+        (token == "--version" && self.builtin_long_enabled("version"))
+            || (token == "-v" && self.builtin_short_enabled("version", 'v'))
+    }
+
     /// Resolves built-ins against `args`, falling through to literal
     /// `run_from`-equivalent execution when none apply. Kept separate from
     /// `run()` so the CLI dispatcher is testable without touching
     /// `std::env::args`.
+    ///
+    /// Matches Citty's dispatch precedence: a help request anywhere in argv
+    /// wins first; only when none is found does the exact-one-token,
+    /// root-only automatic version rule apply; everything else falls
+    /// through to ordinary parsing/execution.
     fn run_cli_from<I, S>(&self, args: I) -> Result<CliAction, RunError>
     where
         I: IntoIterator<Item = S>,
@@ -1771,7 +1777,7 @@ impl Command {
             .map(|arg| arg.as_ref().to_owned())
             .collect();
 
-        match self.resolve_builtin(&args)? {
+        match self.resolve_help(&args)? {
             Builtin::Help {
                 command,
                 display_name,
@@ -1779,9 +1785,16 @@ impl Command {
             } => Ok(CliAction::Help(
                 command.render_usage_named(&display_name, inherited_version),
             )),
-            Builtin::Version(Some(version)) => Ok(CliAction::Version(version.to_owned())),
-            Builtin::Version(None) => Err(RunError::NoVersion),
             Builtin::None => {
+                if let [token] = args.as_slice()
+                    && self.builtin_version_token(token)
+                {
+                    return match self.version.as_deref() {
+                        Some(version) => Ok(CliAction::Version(version.to_owned())),
+                        None => Err(RunError::NoVersion),
+                    };
+                }
+
                 self.run_from(args)?;
                 Ok(CliAction::Ran)
             }
@@ -8073,6 +8086,172 @@ mod tests {
         let action = command.run_cli_from(["--version"]).unwrap();
 
         assert_version(action, "1.2.3");
+    }
+
+    #[test]
+    fn version_requires_exactly_one_token_extra_trailing() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("ritty")
+            .version("1.2.3")
+            .flag(Flag::new("version"))
+            .arg(Arg::new("target"))
+            .handler(move |ctx| {
+                recorded.lock().unwrap().push((
+                    ctx.matches().flag("version"),
+                    ctx.matches().argument("target").map(str::to_owned),
+                ));
+                Ok(())
+            });
+
+        // With a user-declared "version" flag, ["--version", "extra"] must
+        // parse and execute ordinarily rather than being intercepted as the
+        // one-token builtin — proving the fallthrough is real execution, not
+        // just a different CliAction.
+        let action = command.run_cli_from(["--version", "extra"]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(true, Some("extra".to_string()))]
+        );
+    }
+
+    #[test]
+    fn version_requires_exactly_one_token_leading_extra() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        // "extra" is not declared, so ordinary parsing must reject it as an
+        // unexpected positional rather than the dispatcher silently treating
+        // this as a builtin version request.
+        let error = command.run_cli_from(["extra", "--version"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn version_requires_exactly_one_token_short_with_extra() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        let error = command.run_cli_from(["-v", "extra"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn nested_long_version_is_not_automatic() {
+        let command = Command::new("ritty")
+            .version("1.0.0")
+            .command(Command::new("remote"));
+
+        let error = command.run_cli_from(["remote", "--version"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn nested_short_version_is_not_automatic() {
+        let command = Command::new("ritty")
+            .version("1.0.0")
+            .command(Command::new("remote"));
+
+        let error = command.run_cli_from(["remote", "-v"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn child_own_version_metadata_does_not_enable_nested_automatic_version() {
+        let command = Command::new("ritty")
+            .version("1.0.0")
+            .command(Command::new("remote").version("2.0.0"));
+
+        let error = command.run_cli_from(["remote", "--version"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn child_can_declare_its_own_version_option() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("ritty").version("1.0.0").command(
+            Command::new("remote")
+                .flag(Flag::new("version"))
+                .handler(move |ctx| {
+                    recorded.lock().unwrap().push(ctx.matches().flag("version"));
+                    Ok(())
+                }),
+        );
+
+        let action = command.run_cli_from(["remote", "--version"]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(*calls.lock().unwrap(), vec![true]);
+    }
+
+    #[test]
+    fn child_can_declare_its_own_short_v_option() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("ritty").version("1.0.0").command(
+            Command::new("remote")
+                .flag(Flag::new("verbose").short('v'))
+                .handler(move |ctx| {
+                    recorded.lock().unwrap().push(ctx.matches().flag("verbose"));
+                    Ok(())
+                }),
+        );
+
+        let action = command.run_cli_from(["remote", "-v"]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(*calls.lock().unwrap(), vec![true]);
+    }
+
+    #[test]
+    fn help_wins_over_version_when_version_first() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        let action = command.run_cli_from(["--version", "--help"]).unwrap();
+
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn help_wins_over_version_when_help_first() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        let action = command.run_cli_from(["--help", "--version"]).unwrap();
+
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn short_help_wins_over_short_version_when_version_first() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        let action = command.run_cli_from(["-v", "-h"]).unwrap();
+
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn short_help_wins_over_short_version_when_help_first() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        let action = command.run_cli_from(["-h", "-v"]).unwrap();
+
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn root_child_version_extra_token_falls_through_to_no_command() {
+        let command = Command::new("ritty").version("1.0.0");
+
+        let error = command.run_cli_from(["--version", "extra"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
     }
 
     // --- API separation ---
