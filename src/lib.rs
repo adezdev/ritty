@@ -953,14 +953,15 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// The result returned by a command handler.
 pub type HandlerResult = Result<(), BoxError>;
 
-/// A shared, cloneable handler callable. Wrapped so `Command` can derive a
-/// meaningful `Debug` without trying to print closure internals.
+/// A shared, cloneable callable used for handlers, setup hooks, and cleanup
+/// hooks alike. Wrapped so `Command` can derive a meaningful `Debug` without
+/// trying to print closure internals.
 #[derive(Clone)]
-struct Handler(Arc<dyn for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync>);
+struct Hook(Arc<dyn for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync>);
 
-impl std::fmt::Debug for Handler {
+impl std::fmt::Debug for Hook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Handler(..)")
+        f.write_str("Hook(..)")
     }
 }
 
@@ -972,8 +973,14 @@ pub enum RunError {
     /// No handler could be selected: a command has subcommands, none was
     /// selected (explicitly or via default), and the command itself has no handler.
     NoCommand,
+    /// A command's setup hook returned an error. The command's cleanup hook
+    /// still ran (if any); this is the primary failure.
+    Setup(BoxError),
     /// The selected handler returned an error.
     Handler(BoxError),
+    /// A command's cleanup hook returned an error, and no earlier setup,
+    /// handler, or nested-execution failure took precedence over it.
+    Cleanup(BoxError),
 }
 
 impl std::fmt::Display for RunError {
@@ -981,7 +988,9 @@ impl std::fmt::Display for RunError {
         match self {
             RunError::Parse(err) => write!(f, "{err}"),
             RunError::NoCommand => f.write_str("no command specified"),
+            RunError::Setup(err) => write!(f, "{err}"),
             RunError::Handler(err) => write!(f, "{err}"),
+            RunError::Cleanup(err) => write!(f, "{err}"),
         }
     }
 }
@@ -991,7 +1000,9 @@ impl std::error::Error for RunError {
         match self {
             RunError::Parse(err) => Some(err),
             RunError::NoCommand => None,
+            RunError::Setup(err) => Some(err.as_ref()),
             RunError::Handler(err) => Some(err.as_ref()),
+            RunError::Cleanup(err) => Some(err.as_ref()),
         }
     }
 }
@@ -1015,7 +1026,9 @@ pub struct Command {
     enum_options: Vec<EnumOption>,
     default_subcommand: Option<String>,
     hidden: bool,
-    handler: Option<Handler>,
+    handler: Option<Hook>,
+    setup: Option<Hook>,
+    cleanup: Option<Hook>,
 }
 
 impl Command {
@@ -1034,6 +1047,8 @@ impl Command {
             default_subcommand: None,
             hidden: false,
             handler: None,
+            setup: None,
+            cleanup: None,
         }
     }
 
@@ -1043,13 +1058,49 @@ impl Command {
     where
         F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
     {
-        self.handler = Some(Handler(Arc::new(handler)));
+        self.handler = Some(Hook(Arc::new(handler)));
         self
     }
 
     /// Returns whether the command has a handler set.
     pub fn has_handler(&self) -> bool {
         self.handler.is_some()
+    }
+
+    /// Sets the command's setup hook, run before its selected child (if any)
+    /// or its own handler. Setup hooks run root-to-leaf along the selected
+    /// path. If setup fails, this command's child is not entered and its
+    /// handler is not invoked, but its cleanup hook (and every ancestor's
+    /// cleanup hook already entered) still runs.
+    pub fn setup<F>(mut self, setup: F) -> Self
+    where
+        F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
+    {
+        self.setup = Some(Hook(Arc::new(setup)));
+        self
+    }
+
+    /// Returns whether the command has a setup hook set.
+    pub fn has_setup(&self) -> bool {
+        self.setup.is_some()
+    }
+
+    /// Sets the command's cleanup hook. Cleanup is attempted for every
+    /// entered command even when setup, nested execution, or its selected
+    /// handler returns an error; cleanup hooks run leaf-to-root along the
+    /// selected path. A cleanup failure never overwrites an earlier
+    /// setup/handler/nested-execution failure.
+    pub fn cleanup<F>(mut self, cleanup: F) -> Self
+    where
+        F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
+    {
+        self.cleanup = Some(Hook(Arc::new(cleanup)));
+        self
+    }
+
+    /// Returns whether the command has a cleanup hook set.
+    pub fn has_cleanup(&self) -> bool {
+        self.cleanup.is_some()
     }
 
     /// Marks the command as hidden from generated usage/help listings.
@@ -1418,12 +1469,55 @@ impl Command {
         self.execute(&matches, &matches)
     }
 
-    /// Executes the handler selected by `matches`, recursing into a selected
+    /// Executes the command selected by `matches`, recursing into a selected
     /// child by its canonical name rather than re-resolving aliases.
+    ///
+    /// Setup runs before entering a selected child or invoking this
+    /// command's own handler (root-to-leaf along the selected path); cleanup
+    /// is always attempted afterward, even if setup, the child, or the
+    /// handler failed (leaf-to-root). A cleanup failure never overwrites an
+    /// earlier primary failure.
     fn execute<'a>(
         &'a self,
         matches: &'a Matches,
         root_matches: &'a Matches,
+    ) -> Result<(), RunError> {
+        let context = CommandContext {
+            command: self,
+            matches,
+            root_matches,
+        };
+
+        let mut primary: Result<(), RunError> = Ok(());
+
+        if let Some(setup) = &self.setup
+            && let Err(err) = (setup.0)(&context)
+        {
+            primary = Err(RunError::Setup(err));
+        }
+
+        if primary.is_ok() {
+            primary = self.execute_work(matches, root_matches, &context);
+        }
+
+        if let Some(cleanup) = &self.cleanup
+            && let Err(err) = (cleanup.0)(&context)
+            && primary.is_ok()
+        {
+            primary = Err(RunError::Cleanup(err));
+        }
+
+        primary
+    }
+
+    /// Runs the work phase for an entered command whose setup succeeded:
+    /// recurse into a selected child, run this command's own handler, or
+    /// report `NoCommand`/no-op as appropriate.
+    fn execute_work<'a>(
+        &'a self,
+        matches: &'a Matches,
+        root_matches: &'a Matches,
+        context: &CommandContext<'a>,
     ) -> Result<(), RunError> {
         if let Some(name) = matches.subcommand() {
             let child = self
@@ -1438,12 +1532,7 @@ impl Command {
         }
 
         if let Some(handler) = &self.handler {
-            let context = CommandContext {
-                command: self,
-                matches,
-                root_matches,
-            };
-            return (handler.0)(&context).map_err(RunError::Handler);
+            return (handler.0)(context).map_err(RunError::Handler);
         }
 
         if self.subcommands.is_empty() {
@@ -5694,5 +5783,696 @@ mod tests {
 
         assert!(matches!(error, RunError::Parse(_)));
         assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn setup_defaults_to_absent() {
+        let command = Command::new("root");
+
+        assert!(!command.has_setup());
+    }
+
+    #[test]
+    fn cleanup_defaults_to_absent() {
+        let command = Command::new("root");
+
+        assert!(!command.has_cleanup());
+    }
+
+    #[test]
+    fn has_setup_reports_true_once_set() {
+        let command = Command::new("root").setup(|_ctx| Ok(()));
+
+        assert!(command.has_setup());
+    }
+
+    #[test]
+    fn has_cleanup_reports_true_once_set() {
+        let command = Command::new("root").cleanup(|_ctx| Ok(()));
+
+        assert!(command.has_cleanup());
+    }
+
+    #[test]
+    fn root_setup_runs_before_root_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let handler_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .handler(move |_ctx| {
+                handler_calls.lock().unwrap().push("handler");
+                Ok(())
+            });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "handler"]);
+    }
+
+    #[test]
+    fn root_cleanup_runs_after_root_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .handler(move |_ctx| {
+                handler_calls.lock().unwrap().push("handler");
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["handler", "cleanup"]);
+    }
+
+    #[test]
+    fn exact_setup_handler_cleanup_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let handler_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .handler(move |_ctx| {
+                handler_calls.lock().unwrap().push("handler");
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "handler", "cleanup"]);
+    }
+
+    #[test]
+    fn setup_receives_local_matches() {
+        let command = Command::new("root")
+            .arg(Arg::new("name"))
+            .setup(|ctx| {
+                assert_eq!(ctx.matches().argument("name"), Some("alice"));
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_from(["alice"]).unwrap();
+    }
+
+    #[test]
+    fn cleanup_receives_local_matches() {
+        let command = Command::new("root")
+            .arg(Arg::new("name"))
+            .handler(|_ctx| Ok(()))
+            .cleanup(|ctx| {
+                assert_eq!(ctx.matches().argument("name"), Some("alice"));
+                Ok(())
+            });
+
+        command.run_from(["alice"]).unwrap();
+    }
+
+    #[test]
+    fn hooks_receive_root_matches() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose").short('v'))
+            .command(
+                Command::new("build")
+                    .setup(|ctx| {
+                        assert!(ctx.root_matches().flag("verbose"));
+                        Ok(())
+                    })
+                    .handler(|_ctx| Ok(()))
+                    .cleanup(|ctx| {
+                        assert!(ctx.root_matches().flag("verbose"));
+                        Ok(())
+                    }),
+            );
+
+        command.run_from(["-v", "build"]).unwrap();
+    }
+
+    #[test]
+    fn captured_setup_closure_works() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                recorded.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup"]);
+    }
+
+    #[test]
+    fn captured_cleanup_closure_works() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root")
+            .handler(|_ctx| Ok(()))
+            .cleanup(move |_ctx| {
+                recorded.lock().unwrap().push("cleanup");
+                Ok(())
+            });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["cleanup"]);
+    }
+
+    #[test]
+    fn cloned_command_retains_working_setup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                recorded.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        let cloned = command.clone();
+        cloned.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup"]);
+    }
+
+    #[test]
+    fn cloned_command_retains_working_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root")
+            .handler(|_ctx| Ok(()))
+            .cleanup(move |_ctx| {
+                recorded.lock().unwrap().push("cleanup");
+                Ok(())
+            });
+
+        let cloned = command.clone();
+        cloned.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["cleanup"]);
+    }
+
+    #[test]
+    fn nested_setup_runs_root_to_leaf() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_calls = Arc::clone(&calls);
+        let child_calls = Arc::clone(&calls);
+        let leaf_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                root_calls.lock().unwrap().push("root");
+                Ok(())
+            })
+            .command(
+                Command::new("child")
+                    .setup(move |_ctx| {
+                        child_calls.lock().unwrap().push("child");
+                        Ok(())
+                    })
+                    .command(
+                        Command::new("leaf")
+                            .setup(move |_ctx| {
+                                leaf_calls.lock().unwrap().push("leaf");
+                                Ok(())
+                            })
+                            .handler(|_ctx| Ok(())),
+                    ),
+            );
+
+        command.run_from(["child", "leaf"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["root", "child", "leaf"]);
+    }
+
+    #[test]
+    fn nested_cleanup_runs_leaf_to_root() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_calls = Arc::clone(&calls);
+        let child_calls = Arc::clone(&calls);
+        let leaf_calls = Arc::clone(&calls);
+        let command =
+            Command::new("root")
+                .cleanup(move |_ctx| {
+                    root_calls.lock().unwrap().push("root");
+                    Ok(())
+                })
+                .command(
+                    Command::new("child")
+                        .cleanup(move |_ctx| {
+                            child_calls.lock().unwrap().push("child");
+                            Ok(())
+                        })
+                        .command(Command::new("leaf").handler(|_ctx| Ok(())).cleanup(
+                            move |_ctx| {
+                                leaf_calls.lock().unwrap().push("leaf");
+                                Ok(())
+                            },
+                        )),
+                );
+
+        command.run_from(["child", "leaf"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["leaf", "child", "root"]);
+    }
+
+    #[test]
+    fn only_leaf_handler_executes_with_full_lifecycle() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_setup = Arc::clone(&calls);
+        let root_handler = Arc::clone(&calls);
+        let leaf_handler = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                root_setup.lock().unwrap().push("root-setup");
+                Ok(())
+            })
+            .handler(move |_ctx| {
+                root_handler.lock().unwrap().push("root-handler");
+                Ok(())
+            })
+            .command(Command::new("leaf").handler(move |_ctx| {
+                leaf_handler.lock().unwrap().push("leaf-handler");
+                Ok(())
+            }));
+
+        command.run_from(["leaf"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["root-setup", "leaf-handler"]);
+    }
+
+    #[test]
+    fn handlerless_intermediate_command_hooks_execute() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_setup = Arc::clone(&calls);
+        let workspace_setup = Arc::clone(&calls);
+        let workspace_cleanup = Arc::clone(&calls);
+        let deploy_handler = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                root_setup.lock().unwrap().push("root-setup");
+                Ok(())
+            })
+            .command(
+                Command::new("workspace")
+                    .setup(move |_ctx| {
+                        workspace_setup.lock().unwrap().push("workspace-setup");
+                        Ok(())
+                    })
+                    .cleanup(move |_ctx| {
+                        workspace_cleanup.lock().unwrap().push("workspace-cleanup");
+                        Ok(())
+                    })
+                    .command(Command::new("deploy").handler(move |_ctx| {
+                        deploy_handler.lock().unwrap().push("deploy-handler");
+                        Ok(())
+                    })),
+            );
+
+        command.run_from(["workspace", "deploy"]).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "root-setup",
+                "workspace-setup",
+                "deploy-handler",
+                "workspace-cleanup"
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_child_lifecycle_runs_all_hooks() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_setup = Arc::clone(&calls);
+        let root_cleanup = Arc::clone(&calls);
+        let build_setup = Arc::clone(&calls);
+        let build_handler = Arc::clone(&calls);
+        let build_cleanup = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                root_setup.lock().unwrap().push("root-setup");
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                root_cleanup.lock().unwrap().push("root-cleanup");
+                Ok(())
+            })
+            .command(
+                Command::new("build")
+                    .setup(move |_ctx| {
+                        build_setup.lock().unwrap().push("build-setup");
+                        Ok(())
+                    })
+                    .handler(move |_ctx| {
+                        build_handler.lock().unwrap().push("build-handler");
+                        Ok(())
+                    })
+                    .cleanup(move |_ctx| {
+                        build_cleanup.lock().unwrap().push("build-cleanup");
+                        Ok(())
+                    }),
+            );
+
+        command.run_from(["build"]).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "root-setup",
+                "build-setup",
+                "build-handler",
+                "build-cleanup",
+                "root-cleanup"
+            ]
+        );
+    }
+
+    #[test]
+    fn alias_selected_child_lifecycle_runs() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root").command(
+            Command::new("build")
+                .alias("b")
+                .setup(move |_ctx| {
+                    setup_calls.lock().unwrap().push("setup");
+                    Ok(())
+                })
+                .handler(|_ctx| Ok(()))
+                .cleanup(move |_ctx| {
+                    cleanup_calls.lock().unwrap().push("cleanup");
+                    Ok(())
+                }),
+        );
+
+        command.run_from(["b"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "cleanup"]);
+    }
+
+    #[test]
+    fn default_child_lifecycle_runs() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root").default_subcommand("dev").command(
+            Command::new("dev")
+                .setup(move |_ctx| {
+                    setup_calls.lock().unwrap().push("setup");
+                    Ok(())
+                })
+                .handler(|_ctx| Ok(()))
+                .cleanup(move |_ctx| {
+                    cleanup_calls.lock().unwrap().push("cleanup");
+                    Ok(())
+                }),
+        );
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "cleanup"]);
+    }
+
+    #[test]
+    fn hidden_child_lifecycle_runs() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root").command(
+            Command::new("secret")
+                .hidden()
+                .setup(move |_ctx| {
+                    setup_calls.lock().unwrap().push("setup");
+                    Ok(())
+                })
+                .handler(|_ctx| Ok(()))
+                .cleanup(move |_ctx| {
+                    cleanup_calls.lock().unwrap().push("cleanup");
+                    Ok(())
+                }),
+        );
+
+        command.run_from(["secret"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "cleanup"]);
+    }
+
+    #[test]
+    fn cleanup_runs_after_handler_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .handler(|_ctx| Err(Box::new(Boom) as BoxError))
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            });
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+        assert_eq!(*calls.lock().unwrap(), vec!["cleanup"]);
+    }
+
+    #[test]
+    fn handler_error_remains_primary_when_cleanup_also_fails() {
+        let command = Command::new("root")
+            .handler(|_ctx| Err(Box::new(Boom) as BoxError))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+    }
+
+    #[test]
+    fn cleanup_runs_after_setup_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            });
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Setup(_)));
+        assert_eq!(*calls.lock().unwrap(), vec!["cleanup"]);
+    }
+
+    #[test]
+    fn setup_error_remains_primary_when_cleanup_also_fails() {
+        let command = Command::new("root")
+            .setup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Setup(_)));
+    }
+
+    #[test]
+    fn setup_failure_prevents_handler_invocation() {
+        let calls = Arc::new(Mutex::new(0));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .handler(move |_ctx| {
+                *recorded.lock().unwrap() += 1;
+                Ok(())
+            });
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Setup(_)));
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn setup_failure_prevents_child_entry() {
+        let calls = Arc::new(Mutex::new(0));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .command(Command::new("build").handler(move |_ctx| {
+                *recorded.lock().unwrap() += 1;
+                Ok(())
+            }));
+
+        let error = command.run_from(["build"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Setup(_)));
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn parent_cleanup_runs_after_child_handler_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("root-cleanup");
+                Ok(())
+            })
+            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+
+        let error = command.run_from(["build"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+        assert_eq!(*calls.lock().unwrap(), vec!["root-cleanup"]);
+    }
+
+    #[test]
+    fn child_error_remains_primary_when_parent_cleanup_fails() {
+        let command = Command::new("root")
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .command(Command::new("build").handler(|_ctx| Err(Box::new(Boom) as BoxError)));
+
+        let error = command.run_from(["build"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+    }
+
+    #[test]
+    fn cleanup_only_failure_becomes_run_error_cleanup() {
+        let command = Command::new("root")
+            .handler(|_ctx| Ok(()))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Cleanup(_)));
+    }
+
+    #[test]
+    fn deepest_cleanup_failure_wins_over_later_parent_cleanup_failure() {
+        let command = Command::new("root")
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError))
+            .command(
+                Command::new("build")
+                    .handler(|_ctx| Ok(()))
+                    .cleanup(|_ctx| Err(Box::new(Boom) as BoxError)),
+            );
+
+        let error = command.run_from(["build"]).unwrap_err();
+
+        // Both cleanups fail with the same error type/message, but the leaf's
+        // cleanup failure must be the one that establishes the primary
+        // failure the parent's cleanup then fails to override.
+        assert!(matches!(error, RunError::Cleanup(_)));
+        let source = std::error::Error::source(&error).expect("cleanup error has a source");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn cleanup_runs_around_no_command() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            })
+            .command(Command::new("build").handler(|_ctx| Ok(())));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::NoCommand));
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "cleanup"]);
+    }
+
+    #[test]
+    fn empty_no_op_command_still_runs_setup_and_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "cleanup"]);
+    }
+
+    #[test]
+    fn parse_failure_invokes_zero_lifecycle_callbacks() {
+        let calls = Arc::new(Mutex::new(0));
+        let setup_calls = Arc::clone(&calls);
+        let handler_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .setup(move |_ctx| {
+                *setup_calls.lock().unwrap() += 1;
+                Ok(())
+            })
+            .handler(move |_ctx| {
+                *handler_calls.lock().unwrap() += 1;
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                *cleanup_calls.lock().unwrap() += 1;
+                Ok(())
+            });
+
+        let error = command.run_from(["--wat"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn run_error_setup_exposes_source() {
+        let command = Command::new("root").setup(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        let source = std::error::Error::source(&error).expect("setup error has a source");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn run_error_cleanup_exposes_source() {
+        let command = Command::new("root")
+            .handler(|_ctx| Ok(()))
+            .cleanup(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        let source = std::error::Error::source(&error).expect("cleanup error has a source");
+        assert_eq!(source.to_string(), "boom");
     }
 }
