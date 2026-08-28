@@ -1,5 +1,23 @@
 //! Ritty — an elegant CLI builder for Rust.
 
+/// A positional argument in a Ritty command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arg {
+    name: String,
+}
+
+impl Arg {
+    /// Creates a new positional argument.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    /// Returns the argument name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// A command in a Ritty CLI application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -7,6 +25,7 @@ pub struct Command {
     description: Option<String>,
     version: Option<String>,
     subcommands: Vec<Command>,
+    arguments: Vec<Arg>,
 }
 
 impl Command {
@@ -17,6 +36,7 @@ impl Command {
             description: None,
             version: None,
             subcommands: Vec::new(),
+            arguments: Vec::new(),
         }
     }
 
@@ -41,6 +61,17 @@ impl Command {
     /// Returns the command's subcommands.
     pub fn subcommands(&self) -> &[Command] {
         &self.subcommands
+    }
+
+    /// Adds a positional argument.
+    pub fn arg(mut self, arg: Arg) -> Self {
+        self.arguments.push(arg);
+        self
+    }
+
+    /// Returns the command's positional arguments.
+    pub fn arguments(&self) -> &[Arg] {
+        &self.arguments
     }
 
     /// Returns the command name.
@@ -92,5 +123,13 @@ mod tests {
 
         assert_eq!(command.subcommands().len(), 1);
         assert_eq!(command.subcommands()[0].name(), "build");
+    }
+
+    #[test]
+    fn adds_argument() {
+        let command = Command::new("ritty").arg(Arg::new("name"));
+
+        assert_eq!(command.arguments().len(), 1);
+        assert_eq!(command.arguments()[0].name(), "name");
     }
 }
