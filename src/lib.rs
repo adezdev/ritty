@@ -55,12 +55,21 @@ impl Flag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matches {
     flags: Vec<String>,
+    arguments: Vec<(String, String)>,
 }
 
 impl Matches {
     /// Returns whether a flag was present.
     pub fn flag(&self, name: &str) -> bool {
         self.flags.iter().any(|flag| flag == name)
+    }
+
+    /// Returns the value of a positional argument.
+    pub fn argument(&self, name: &str) -> Option<&str> {
+        self.arguments
+            .iter()
+            .find(|(argument, _)| argument == name)
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -152,7 +161,11 @@ impl Command {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut matches = Matches { flags: Vec::new() };
+        let mut matches = Matches {
+            flags: Vec::new(),
+            arguments: Vec::new(),
+        };
+        let mut positional = 0;
 
         for arg in args {
             let arg = arg.as_ref();
@@ -186,6 +199,18 @@ impl Command {
                     message: format!("unknown flag: -{short}"),
                 });
             }
+
+            if let Some(argument) = self.arguments.get(positional) {
+                matches
+                    .arguments
+                    .push((argument.name().to_owned(), arg.to_owned()));
+                positional += 1;
+                continue;
+            }
+
+            return Err(ParseError {
+                message: format!("unexpected argument: {arg}"),
+            });
         }
 
         Ok(matches)
@@ -275,5 +300,14 @@ mod tests {
         let matches = command.parse_from(["-v"]).unwrap();
 
         assert!(matches.flag("verbose"));
+    }
+
+    #[test]
+    fn parses_positional_argument() {
+        let command = Command::new("ritty").arg(Arg::new("name"));
+
+        let matches = command.parse_from(["world"]).unwrap();
+
+        assert_eq!(matches.argument("name"), Some("world"));
     }
 }
