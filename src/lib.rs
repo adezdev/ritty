@@ -167,6 +167,25 @@ impl Command {
                     message: format!("unknown flag: --{name}"),
                 });
             }
+
+            if let Some(short) = arg.strip_prefix('-') {
+                if short.len() == 1 {
+                    let short = short.chars().next().unwrap();
+
+                    if let Some(flag) = self
+                        .flags
+                        .iter()
+                        .find(|flag| flag.short_name() == Some(short))
+                    {
+                        matches.flags.push(flag.name().to_owned());
+                        continue;
+                    }
+                }
+
+                return Err(ParseError {
+                    message: format!("unknown flag: -{short}"),
+                });
+            }
         }
 
         Ok(matches)
@@ -245,6 +264,15 @@ mod tests {
         let command = Command::new("ritty").flag(Flag::new("verbose"));
 
         let matches = command.parse_from(["--verbose"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+    }
+
+    #[test]
+    fn parses_short_flag() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v'));
+
+        let matches = command.parse_from(["-v"]).unwrap();
 
         assert!(matches.flag("verbose"));
     }
