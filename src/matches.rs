@@ -1,4 +1,32 @@
+//! Read-only parsed command-line results.
+//!
+//! [`Matches`] stores values under their canonical declared names and keeps
+//! each selected subcommand's values in a nested match tree. Import this
+//! module directly when inspecting parser output without the root facade.
+
 /// Parsed command-line matches.
+///
+/// Lookups use canonical names even when input used an alias. Parent and child
+/// values remain in separate [`Matches`] nodes.
+///
+/// # Example
+///
+/// ```
+/// use ritty::{Arg, Command, Flag};
+///
+/// let command = Command::new("tool")
+///     .flag(Flag::new("verbose").alias("chatty"))
+///     .command(Command::new("inspect").alias("i").arg(Arg::new("path")));
+/// let matches = command.parse_from(["--chatty", "i", "src"])?;
+///
+/// assert!(matches.flag("verbose"));
+/// assert_eq!(matches.subcommand(), Some("inspect"));
+/// assert_eq!(
+///     matches.subcommand_matches().unwrap().argument("path"),
+///     Some("src")
+/// );
+/// # Ok::<(), ritty::ParseError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matches {
     flags: Vec<(String, bool)>,

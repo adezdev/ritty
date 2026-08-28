@@ -1,3 +1,10 @@
+//! Command construction, execution, lifecycle, and lazy subcommands.
+//!
+//! This module contains [`Command`], handler [`CommandContext`], type-erased
+//! [`CommandOutput`], reusable [`Plugin`] lifecycle hooks, and the common
+//! [`HandlerResult`] and [`BoxError`] aliases. Import from here when using the
+//! logical module API instead of Ritty's root facade or prelude.
+
 mod parser;
 mod usage;
 
@@ -34,12 +41,34 @@ enum CliAction {
     Version(String),
     Ran,
 }
-/// A command in a Ritty CLI application.
 /// The context handed to a command's handler when it runs.
 ///
 /// `matches()` is the selected command's own parsed matches; `root_matches()`
 /// is the complete top-level parse result, so a nested handler can still
 /// inspect parent/global options without Ritty flattening match ownership.
+///
+/// # Example
+///
+/// ```
+/// use ritty::{Arg, Command, Flag};
+///
+/// let command = Command::new("tool")
+///     .flag(Flag::new("verbose"))
+///     .command(Command::new("show").arg(Arg::new("item")).handler(|ctx| {
+///         Ok((
+///             ctx.command().name().to_owned(),
+///             ctx.matches().argument("item").unwrap().to_owned(),
+///             ctx.root_matches().flag("verbose"),
+///         ))
+///     }));
+///
+/// let output = command.run_from(["--verbose", "show", "config"])?;
+/// assert_eq!(
+///     output.downcast::<(String, String, bool)>().unwrap(),
+///     ("show".to_owned(), "config".to_owned(), true)
+/// );
+/// # Ok::<(), ritty::RunError>(())
+/// ```
 #[derive(Debug)]
 pub struct CommandContext<'a> {
     command: &'a Command,
@@ -79,6 +108,21 @@ pub type HandlerResult<T = ()> = Result<T, BoxError>;
 /// behind `Box<dyn Any>` without requiring `Clone`, `Debug`, `Send`, or
 /// `Sync` from the contained type. Recover the value with [`Self::downcast`]
 /// or inspect it with [`Self::is`]/[`Self::downcast_ref`].
+///
+/// # Example
+///
+/// ```
+/// use std::rc::Rc;
+/// use ritty::Command;
+///
+/// let command = Command::new("value").handler(|_| Ok(Rc::new(String::from("local"))));
+/// let output = command.run_from([] as [&str; 0])?;
+///
+/// assert!(output.is::<Rc<String>>());
+/// assert_eq!(output.downcast_ref::<Rc<String>>().unwrap().as_str(), "local");
+/// assert_eq!(output.downcast::<Rc<String>>().unwrap().as_str(), "local");
+/// # Ok::<(), ritty::RunError>(())
+/// ```
 pub struct CommandOutput {
     value: Box<dyn std::any::Any>,
     type_name: &'static str,
@@ -183,6 +227,44 @@ impl std::fmt::Debug for Lazy {
 /// A `Plugin` is a concrete, cloneable value: because its lifecycle hooks
 /// are Arc-backed, cloning a plugin to attach it to multiple commands
 /// shares its captured closure state rather than duplicating it.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+/// use ritty::{Command, Plugin};
+///
+/// let events = Arc::new(Mutex::new(Vec::new()));
+/// let plugin = Plugin::new("audit")
+///     .setup({
+///         let events = Arc::clone(&events);
+///         move |_| {
+///             events.lock().unwrap().push("plugin setup");
+///             Ok(())
+///         }
+///     })
+///     .cleanup({
+///         let events = Arc::clone(&events);
+///         move |_| {
+///             events.lock().unwrap().push("plugin cleanup");
+///             Ok(())
+///         }
+///     });
+/// let command = Command::new("tool").plugin(plugin).handler({
+///     let events = Arc::clone(&events);
+///     move |_| {
+///         events.lock().unwrap().push("handler");
+///         Ok(())
+///     }
+/// });
+///
+/// command.run_from([] as [&str; 0])?;
+/// assert_eq!(
+///     *events.lock().unwrap(),
+///     ["plugin setup", "handler", "plugin cleanup"]
+/// );
+/// # Ok::<(), ritty::RunError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct Plugin {
     name: String,
@@ -236,6 +318,27 @@ impl Plugin {
     }
 }
 
+/// A command in a Ritty CLI application.
+///
+/// Builder methods define metadata, inputs, child commands, lifecycle hooks,
+/// and the selected leaf handler. A command can be parsed with
+/// [`Self::parse_from`], executed programmatically with [`Self::run_from`], or
+/// run against process argv with [`Self::run`].
+///
+/// # Example
+///
+/// ```
+/// use ritty::{Arg, Command};
+///
+/// let command = Command::new("echo")
+///     .description("Echo a value")
+///     .arg(Arg::new("value").required())
+///     .handler(|ctx| Ok(ctx.matches().argument("value").unwrap().to_owned()));
+///
+/// let output = command.run_from(["hello"])?;
+/// assert_eq!(output.downcast::<String>().unwrap(), "hello");
+/// # Ok::<(), ritty::RunError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct Command {
     name: String,
@@ -302,6 +405,23 @@ impl Command {
     /// name) against this child does require resolving it — and, mirroring
     /// Citty, may also resolve other not-yet-resolved lazy siblings while
     /// searching. A direct canonical-name match never pays this cost.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ritty::{Arg, Command};
+    ///
+    /// let command = Command::new("ritty").lazy_command("build", || {
+    ///     Command::new("build")
+    ///         .description("Build the project")
+    ///         .arg(Arg::new("package").default("workspace"))
+    ///         .handler(|ctx| Ok(ctx.matches().argument("package").unwrap().to_owned()))
+    /// });
+    ///
+    /// let output = command.run_from(["build", "core"])?;
+    /// assert_eq!(output.downcast::<String>().unwrap(), "core");
+    /// # Ok::<(), ritty::RunError>(())
+    /// ```
     pub fn lazy_command<F>(mut self, name: impl Into<String>, loader: F) -> Self
     where
         F: Fn() -> Command + Send + Sync + 'static,
@@ -619,6 +739,20 @@ impl Command {
     /// the coherent behavior is to propagate that leaf's output through
     /// every parent frame — this is a deliberate divergence, not an
     /// oversight.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ritty::{Arg, Command};
+    ///
+    /// let command = Command::new("length")
+    ///     .arg(Arg::new("value").required())
+    ///     .handler(|ctx| Ok(ctx.matches().argument("value").unwrap().len()));
+    ///
+    /// let output = command.run_from(["ritty"])?;
+    /// assert_eq!(output.downcast::<usize>().unwrap(), 5);
+    /// # Ok::<(), ritty::RunError>(())
+    /// ```
     pub fn run_from<I, S>(&self, args: I) -> Result<CommandOutput, RunError>
     where
         I: IntoIterator<Item = S>,
@@ -799,6 +933,19 @@ impl Command {
     /// runs zero handler, setup, cleanup, or plugin hooks. `run_from` remains
     /// the literal, programmatic counterpart and never special-cases these
     /// spellings.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use ritty::{Command, RunError};
+    ///
+    /// fn main() -> Result<(), RunError> {
+    ///     Command::new("tool")
+    ///         .version("0.1.0")
+    ///         .handler(|_| Ok(()))
+    ///         .run()
+    /// }
+    /// ```
     pub fn run(&self) -> Result<(), RunError> {
         let args: Vec<String> = std::env::args().skip(1).collect();
 

@@ -3,5 +3,6 @@ name = "ritty"
 version = "0.1.0"
 edition = "2024"
 description = "Elegant CLI builder for Rust"
+readme = "README.md"
 
 [dependencies]

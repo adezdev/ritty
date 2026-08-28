@@ -354,6 +354,25 @@ impl Command {
     /// Renders deterministic, plain-text usage for this command. Hidden
     /// subcommands are omitted from the listing and the synopsis, but remain
     /// fully parseable — hidden is presentation-only.
+    ///
+    /// Rendering can resolve lazy children because their descriptions,
+    /// aliases, and hidden state are loaded metadata; the resolved command is
+    /// then retained in its shared cache.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ritty::{Arg, Command, Flag};
+    ///
+    /// let command = Command::new("greet")
+    ///     .description("Print a greeting")
+    ///     .arg(Arg::new("name").default("world"))
+    ///     .flag(Flag::new("excited").short('e'));
+    /// let usage = command.render_usage();
+    ///
+    /// assert!(usage.contains("USAGE greet [OPTIONS] [NAME]"));
+    /// assert!(usage.contains("-e, --excited"));
+    /// ```
     pub fn render_usage(&self) -> String {
         let this = self.resolved();
         this.render_usage_named(this.name(), None)
@@ -361,6 +380,13 @@ impl Command {
 
     /// Writes the rendered usage to stdout, propagating any I/O error rather
     /// than panicking.
+    ///
+    /// ```no_run
+    /// use ritty::Command;
+    ///
+    /// Command::new("tool").show_usage()?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn show_usage(&self) -> std::io::Result<()> {
         use std::io::Write;
         writeln!(std::io::stdout(), "{}", self.render_usage())

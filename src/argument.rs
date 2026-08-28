@@ -1,4 +1,28 @@
+//! Input definitions accepted by a [`Command`](crate::Command).
+//!
+//! Import from this module when defining positional [`Arg`] values, boolean
+//! [`Flag`] values, free-form [`StringOption`] values, or constrained
+//! [`EnumOption`] values without using Ritty's root facade or prelude.
+
 /// A positional argument in a Ritty command.
+///
+/// Arguments bind positionally in declaration order. A default satisfies a
+/// required argument when no token is supplied.
+///
+/// # Example
+///
+/// ```
+/// use ritty::{Arg, Command};
+///
+/// let command = Command::new("copy")
+///     .arg(Arg::new("source").required().value_hint("file"))
+///     .arg(Arg::new("destination").default("."));
+/// let matches = command.parse_from(["notes.txt"])?;
+///
+/// assert_eq!(matches.argument("source"), Some("notes.txt"));
+/// assert_eq!(matches.argument("destination"), Some("."));
+/// # Ok::<(), ritty::ParseError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg {
     name: String,
@@ -70,7 +94,27 @@ impl Arg {
     }
 }
 
-/// A named string option in a Ritty command, e.g. `--name value`.
+/// A named string option in a Ritty command, such as `--output target`.
+///
+/// One-character aliases work as short options, and every alias is
+/// canonicalized to the declared name in [`Matches`](crate::Matches).
+///
+/// # Example
+///
+/// ```
+/// use ritty::{Command, StringOption};
+///
+/// let command = Command::new("build").option(
+///     StringOption::new("output")
+///         .alias("o")
+///         .description("Output directory")
+///         .value_hint("dir"),
+/// );
+/// let matches = command.parse_from(["-o", "dist"])?;
+///
+/// assert_eq!(matches.option("output"), Some("dist"));
+/// # Ok::<(), ritty::ParseError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringOption {
     name: String,
@@ -156,8 +200,26 @@ impl StringOption {
     }
 }
 
-/// A named enum option in a Ritty command, e.g. `--level info`, whose value
-/// must belong to a declared set of allowed values.
+/// A named enum option whose value must belong to a declared set.
+///
+/// An empty allowed-value list accepts any value. Otherwise invalid explicit
+/// values and invalid defaults produce a structured parse error.
+///
+/// # Example
+///
+/// ```
+/// use ritty::{Command, EnumOption};
+///
+/// let command = Command::new("report").enum_option(
+///     EnumOption::new("format", ["text", "json"])
+///         .alias("f")
+///         .default("text"),
+/// );
+/// let matches = command.parse_from(["--format=json"])?;
+///
+/// assert_eq!(matches.enum_option("format"), Some("json"));
+/// # Ok::<(), ritty::ParseError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumOption {
     name: String,
@@ -255,6 +317,27 @@ impl EnumOption {
 }
 
 /// A boolean flag in a Ritty command.
+///
+/// A flag is enabled by its positive spelling and disabled by its `--no-*`
+/// spelling. Explicit `=value` forms accept only lowercase `true` or `false`.
+///
+/// # Example
+///
+/// ```
+/// use ritty::{Command, Flag};
+///
+/// let command = Command::new("deploy").flag(
+///     Flag::new("verbose")
+///         .short('v')
+///         .alias("chatty")
+///         .default(true),
+/// );
+///
+/// assert!(!command.parse_from(["--no-verbose"])?.flag("verbose"));
+/// assert!(!command.parse_from(["-v=false"])?.flag("verbose"));
+/// assert!(command.parse_from(["--chatty=true"])?.flag("verbose"));
+/// # Ok::<(), ritty::ParseError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
     name: String,

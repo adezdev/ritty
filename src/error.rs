@@ -1,3 +1,10 @@
+//! Structured parsing and execution errors.
+//!
+//! [`ParseError`] pairs a human-readable message with [`ParseErrorKind`] and
+//! [`ArgumentErrorKind`] classifications. [`RunError`] preserves parse errors
+//! and distinguishes handler, lifecycle, built-in, and output failures. Import
+//! this module directly when matching errors without the root facade.
+
 use crate::command::BoxError;
 
 /// The specific kind of argument/option-level parse failure.
@@ -21,7 +28,10 @@ pub enum ArgumentErrorKind {
     UnexpectedArgument,
 }
 
-/// The top-level classification of a `ParseError`.
+/// The top-level classification of a [`ParseError`].
+///
+/// Argument and option failures carry the more specific
+/// [`ArgumentErrorKind`] classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseErrorKind {
     /// An argument/option-level failure; see `ArgumentErrorKind` for the subtype.
@@ -35,6 +45,26 @@ pub enum ParseErrorKind {
 }
 
 /// An error produced while parsing command-line input.
+///
+/// [`Self::kind`] is intended for programmatic handling, while
+/// [`std::fmt::Display`] supplies the user-facing message.
+///
+/// # Example
+///
+/// ```
+/// use ritty::{ArgumentErrorKind, Command, ParseErrorKind};
+///
+/// let error = Command::new("tool")
+///     .parse_from(["--unknown"])
+///     .unwrap_err();
+///
+/// match error.kind() {
+///     ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption) => {
+///         assert_eq!(error.to_string(), "unknown flag: --unknown");
+///     }
+///     other => panic!("unexpected parse error: {other:?}"),
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     kind: ParseErrorKind,

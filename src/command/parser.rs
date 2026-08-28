@@ -376,7 +376,23 @@ impl Command {
         Ok(Some(child.resolved()))
     }
 
-    /// Parses command-line arguments.
+    /// Parses command-line arguments without executing a handler or
+    /// interpreting built-in help/version spellings.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ritty::{Command, Flag, StringOption};
+    ///
+    /// let command = Command::new("tool")
+    ///     .flag(Flag::new("verbose").short('v'))
+    ///     .option(StringOption::new("output").alias("o"));
+    /// let matches = command.parse_from(["-v", "-o", "dist"])?;
+    ///
+    /// assert!(matches.flag("verbose"));
+    /// assert_eq!(matches.option("output"), Some("dist"));
+    /// # Ok::<(), ritty::ParseError>(())
+    /// ```
     pub fn parse_from<I, S>(&self, args: I) -> Result<Matches, ParseError>
     where
         I: IntoIterator<Item = S>,
