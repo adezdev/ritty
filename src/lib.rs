@@ -437,18 +437,72 @@ impl Matches {
     }
 }
 
+/// The specific kind of argument/option-level parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentErrorKind {
+    /// An option token (long, short, or `=` form) matched no declared flag or option.
+    UnknownOption,
+    /// An option token matched more than one declared flag/option/enum option.
+    AmbiguousOption,
+    /// A string or enum option was given with no following value token.
+    MissingOptionValue,
+    /// An enum option's value did not match any of its declared allowed values.
+    InvalidOptionValue,
+    /// A required positional argument was not supplied.
+    MissingRequiredArgument,
+    /// A required flag, string option, or enum option was not supplied.
+    MissingRequiredOption,
+    /// A positional token was supplied with no remaining argument slot to receive it.
+    UnexpectedArgument,
+}
+
+/// The top-level classification of a `ParseError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// An argument/option-level failure; see `ArgumentErrorKind` for the subtype.
+    Argument(ArgumentErrorKind),
+    /// An explicit subcommand or alias token matched no declared subcommand.
+    UnknownCommand,
+    /// A subcommand or alias token matched more than one declared subcommand.
+    AmbiguousCommand,
+    /// A configured default subcommand name did not resolve to exactly one child.
+    DefaultSubcommandNotFound,
+}
+
 /// An error produced while parsing command-line input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
+    kind: ParseErrorKind,
     message: String,
 }
 
 impl ParseError {
+    /// Constructs a `ParseError` with an explicit kind and message.
+    fn new(kind: ParseErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Returns the machine-readable classification of this error.
+    pub fn kind(&self) -> ParseErrorKind {
+        self.kind
+    }
+
     /// Returns the parse error message.
     pub fn message(&self) -> &str {
         &self.message
     }
 }
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 /// Resolution of a bare long-option token to either a flag (with its
 /// effective positive/negative value) or a string option.
@@ -540,14 +594,15 @@ fn validate_enum_value(option: &EnumOption, value: &str) -> Result<(), ParseErro
         return Ok(());
     }
 
-    Err(ParseError {
-        message: format!(
+    Err(ParseError::new(
+        ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue),
+        format!(
             "invalid value for option: --{}: {} (expected one of: {})",
             option.name(),
             value,
             option.values().join(", ")
         ),
-    })
+    ))
 }
 
 /// A two-column usage row: left-hand label and right-hand detail. An empty
@@ -1092,9 +1147,10 @@ impl Command {
         if positive_flags.len() + string_options.len() + enum_options.len() + negative_flags.len()
             > 1
         {
-            return Err(ParseError {
-                message: format!("ambiguous option: --{name}"),
-            });
+            return Err(ParseError::new(
+                ParseErrorKind::Argument(ArgumentErrorKind::AmbiguousOption),
+                format!("ambiguous option: --{name}"),
+            ));
         }
 
         if let Some(flag) = positive_flags.first() {
@@ -1124,9 +1180,10 @@ impl Command {
         let enum_candidates = self.enum_options_matching_short(short);
 
         if flag_candidates.len() + option_candidates.len() + enum_candidates.len() > 1 {
-            return Err(ParseError {
-                message: format!("ambiguous option: -{short}"),
-            });
+            return Err(ParseError::new(
+                ParseErrorKind::Argument(ArgumentErrorKind::AmbiguousOption),
+                format!("ambiguous option: -{short}"),
+            ));
         }
 
         if let Some(flag) = flag_candidates.first() {
@@ -1165,9 +1222,10 @@ impl Command {
             + enum_candidates.len()
             > 1
         {
-            return Err(ParseError {
-                message: format!("ambiguous option: --{name}"),
-            });
+            return Err(ParseError::new(
+                ParseErrorKind::Argument(ArgumentErrorKind::AmbiguousOption),
+                format!("ambiguous option: --{name}"),
+            ));
         }
 
         Ok((
@@ -1186,9 +1244,10 @@ impl Command {
         let enum_candidates = self.enum_options_matching_short(short);
 
         if flag_candidates.len() + string_candidates.len() + enum_candidates.len() > 1 {
-            return Err(ParseError {
-                message: format!("ambiguous option: -{short}"),
-            });
+            return Err(ParseError::new(
+                ParseErrorKind::Argument(ArgumentErrorKind::AmbiguousOption),
+                format!("ambiguous option: -{short}"),
+            ));
         }
 
         Ok((
@@ -1208,13 +1267,17 @@ impl Command {
         let candidates = self.subcommands_matching(default_name);
 
         if candidates.len() > 1 {
-            return Err(ParseError {
-                message: format!("ambiguous command: {default_name}"),
-            });
+            return Err(ParseError::new(
+                ParseErrorKind::AmbiguousCommand,
+                format!("ambiguous command: {default_name}"),
+            ));
         }
 
-        let child = candidates.first().copied().ok_or_else(|| ParseError {
-            message: format!("default subcommand not found: {default_name}"),
+        let child = candidates.first().copied().ok_or_else(|| {
+            ParseError::new(
+                ParseErrorKind::DefaultSubcommandNotFound,
+                format!("default subcommand not found: {default_name}"),
+            )
         })?;
 
         Ok(Some(child))
@@ -1297,9 +1360,10 @@ impl Command {
                             continue;
                         }
 
-                        return Err(ParseError {
-                            message: format!("unknown flag: --{name}"),
-                        });
+                        return Err(ParseError::new(
+                            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption),
+                            format!("unknown flag: --{name}"),
+                        ));
                     }
 
                     let name = rest;
@@ -1311,8 +1375,11 @@ impl Command {
                             continue;
                         }
                         Some(LongMatch::Option(option)) => {
-                            let value = args.get(index + 1).ok_or_else(|| ParseError {
-                                message: format!("missing value for option: --{name}"),
+                            let value = args.get(index + 1).ok_or_else(|| {
+                                ParseError::new(
+                                    ParseErrorKind::Argument(ArgumentErrorKind::MissingOptionValue),
+                                    format!("missing value for option: --{name}"),
+                                )
                             })?;
                             matches
                                 .options
@@ -1321,8 +1388,11 @@ impl Command {
                             continue;
                         }
                         Some(LongMatch::EnumOption(option)) => {
-                            let value = args.get(index + 1).ok_or_else(|| ParseError {
-                                message: format!("missing value for option: --{name}"),
+                            let value = args.get(index + 1).ok_or_else(|| {
+                                ParseError::new(
+                                    ParseErrorKind::Argument(ArgumentErrorKind::MissingOptionValue),
+                                    format!("missing value for option: --{name}"),
+                                )
                             })?;
                             matches
                                 .enum_options
@@ -1352,9 +1422,10 @@ impl Command {
                                 }
                             }
 
-                            return Err(ParseError {
-                                message: format!("unknown flag: --{name}"),
-                            });
+                            return Err(ParseError::new(
+                                ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption),
+                                format!("unknown flag: --{name}"),
+                            ));
                         }
                     }
                 }
@@ -1389,9 +1460,10 @@ impl Command {
                             }
                         }
 
-                        return Err(ParseError {
-                            message: format!("unknown flag: -{rest}"),
-                        });
+                        return Err(ParseError::new(
+                            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption),
+                            format!("unknown flag: -{rest}"),
+                        ));
                     }
 
                     if let Some(short) = single_char(rest) {
@@ -1402,8 +1474,13 @@ impl Command {
                                 continue;
                             }
                             Some(ShortMatch::Option(option)) => {
-                                let value = args.get(index + 1).ok_or_else(|| ParseError {
-                                    message: format!("missing value for option: -{short}"),
+                                let value = args.get(index + 1).ok_or_else(|| {
+                                    ParseError::new(
+                                        ParseErrorKind::Argument(
+                                            ArgumentErrorKind::MissingOptionValue,
+                                        ),
+                                        format!("missing value for option: -{short}"),
+                                    )
                                 })?;
                                 matches
                                     .options
@@ -1412,8 +1489,13 @@ impl Command {
                                 continue;
                             }
                             Some(ShortMatch::EnumOption(option)) => {
-                                let value = args.get(index + 1).ok_or_else(|| ParseError {
-                                    message: format!("missing value for option: -{short}"),
+                                let value = args.get(index + 1).ok_or_else(|| {
+                                    ParseError::new(
+                                        ParseErrorKind::Argument(
+                                            ArgumentErrorKind::MissingOptionValue,
+                                        ),
+                                        format!("missing value for option: -{short}"),
+                                    )
                                 })?;
                                 matches
                                     .enum_options
@@ -1446,17 +1528,19 @@ impl Command {
                         }
                     }
 
-                    return Err(ParseError {
-                        message: format!("unknown flag: -{rest}"),
-                    });
+                    return Err(ParseError::new(
+                        ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption),
+                        format!("unknown flag: -{rest}"),
+                    ));
                 }
 
                 let candidates = self.subcommands_matching(arg);
 
                 if candidates.len() > 1 {
-                    return Err(ParseError {
-                        message: format!("ambiguous command: {arg}"),
-                    });
+                    return Err(ParseError::new(
+                        ParseErrorKind::AmbiguousCommand,
+                        format!("ambiguous command: {arg}"),
+                    ));
                 }
 
                 if let Some(child) = candidates.first() {
@@ -1493,14 +1577,16 @@ impl Command {
             }
 
             if !self.subcommands.is_empty() {
-                return Err(ParseError {
-                    message: format!("unknown command: {arg}"),
-                });
+                return Err(ParseError::new(
+                    ParseErrorKind::UnknownCommand,
+                    format!("unknown command: {arg}"),
+                ));
             }
 
-            return Err(ParseError {
-                message: format!("unexpected argument: {arg}"),
-            });
+            return Err(ParseError::new(
+                ParseErrorKind::Argument(ArgumentErrorKind::UnexpectedArgument),
+                format!("unexpected argument: {arg}"),
+            ));
         }
 
         self.finalize(&mut matches, positional)?;
@@ -1529,9 +1615,10 @@ impl Command {
                     .arguments
                     .push((argument.name().to_owned(), default.to_owned())),
                 None if argument.is_required() => {
-                    return Err(ParseError {
-                        message: format!("missing required argument: {}", argument.name()),
-                    });
+                    return Err(ParseError::new(
+                        ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredArgument),
+                        format!("missing required argument: {}", argument.name()),
+                    ));
                 }
                 None => {}
             }
@@ -1545,9 +1632,10 @@ impl Command {
             match flag.default_value() {
                 Some(default) => matches.set_flag(flag.name(), default),
                 None if flag.is_required() => {
-                    return Err(ParseError {
-                        message: format!("missing required option: --{}", flag.name()),
-                    });
+                    return Err(ParseError::new(
+                        ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredOption),
+                        format!("missing required option: --{}", flag.name()),
+                    ));
                 }
                 None => {}
             }
@@ -1563,9 +1651,10 @@ impl Command {
                     .options
                     .push((option.name().to_owned(), default.to_owned())),
                 None if option.is_required() => {
-                    return Err(ParseError {
-                        message: format!("missing required option: --{}", option.name()),
-                    });
+                    return Err(ParseError::new(
+                        ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredOption),
+                        format!("missing required option: --{}", option.name()),
+                    ));
                 }
                 None => {}
             }
@@ -1581,9 +1670,10 @@ impl Command {
                     .enum_options
                     .push((option.name().to_owned(), default.to_owned())),
                 None if option.is_required() => {
-                    return Err(ParseError {
-                        message: format!("missing required option: --{}", option.name()),
-                    });
+                    return Err(ParseError::new(
+                        ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredOption),
+                        format!("missing required option: --{}", option.name()),
+                    ));
                 }
                 None => {}
             }
@@ -4864,5 +4954,204 @@ mod tests {
         let second = command.render_usage();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unknown_long_option_has_unknown_option_kind() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["--wat"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption)
+        );
+    }
+
+    #[test]
+    fn unknown_short_option_has_unknown_option_kind() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["-x"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption)
+        );
+    }
+
+    #[test]
+    fn ambiguous_option_has_ambiguous_option_kind() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose").short('v'))
+            .option(StringOption::new("value").alias("v"));
+
+        let error = command.parse_from(["-v"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::AmbiguousOption)
+        );
+    }
+
+    #[test]
+    fn missing_string_option_value_has_missing_option_value_kind() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        let error = command.parse_from(["--name"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingOptionValue)
+        );
+    }
+
+    #[test]
+    fn missing_enum_option_value_has_missing_option_value_kind() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("level", ["debug", "info"]));
+
+        let error = command.parse_from(["--level"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingOptionValue)
+        );
+    }
+
+    #[test]
+    fn invalid_enum_value_has_invalid_option_value_kind() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("level", ["debug", "info"]));
+
+        let error = command.parse_from(["--level", "nope"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue)
+        );
+    }
+
+    #[test]
+    fn missing_required_positional_has_missing_required_argument_kind() {
+        let command = Command::new("ritty").arg(Arg::new("target").required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredArgument)
+        );
+    }
+
+    #[test]
+    fn missing_required_boolean_flag_has_missing_required_option_kind() {
+        let command = Command::new("ritty").flag(Flag::new("confirm").required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredOption)
+        );
+    }
+
+    #[test]
+    fn missing_required_string_option_has_missing_required_option_kind() {
+        let command = Command::new("ritty").option(StringOption::new("name").required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredOption)
+        );
+    }
+
+    #[test]
+    fn missing_required_enum_option_has_missing_required_option_kind() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredOption)
+        );
+    }
+
+    #[test]
+    fn unexpected_positional_has_unexpected_argument_kind() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["extra"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnexpectedArgument)
+        );
+    }
+
+    #[test]
+    fn unknown_command_has_unknown_command_kind() {
+        let command = Command::new("ritty").command(Command::new("build"));
+
+        let error = command.parse_from(["deploy"]).unwrap_err();
+
+        assert_eq!(error.kind(), ParseErrorKind::UnknownCommand);
+    }
+
+    #[test]
+    fn ambiguous_command_has_ambiguous_command_kind() {
+        let command = Command::new("ritty")
+            .command(Command::new("install").alias("x"))
+            .command(Command::new("inspect").alias("x"));
+
+        let error = command.parse_from(["x"]).unwrap_err();
+
+        assert_eq!(error.kind(), ParseErrorKind::AmbiguousCommand);
+    }
+
+    #[test]
+    fn missing_configured_default_subcommand_has_default_subcommand_not_found_kind() {
+        let command = Command::new("root").default_subcommand("build");
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.kind(), ParseErrorKind::DefaultSubcommandNotFound);
+    }
+
+    #[test]
+    fn nested_default_child_error_retains_original_kind() {
+        let command = Command::new("root")
+            .default_subcommand("build")
+            .command(Command::new("build").option(StringOption::new("output").required()));
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingRequiredOption)
+        );
+    }
+
+    #[test]
+    fn parse_error_display_equals_message() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["--wat"]).unwrap_err();
+
+        assert_eq!(error.to_string(), error.message());
+    }
+
+    #[test]
+    fn parse_error_implements_std_error() {
+        fn assert_error<E: std::error::Error>(_: &E) {}
+
+        let command = Command::new("ritty");
+        let error = command.parse_from(["--wat"]).unwrap_err();
+
+        assert_error(&error);
     }
 }
