@@ -447,7 +447,9 @@ pub enum ArgumentErrorKind {
     AmbiguousOption,
     /// A string or enum option was given with no following value token.
     MissingOptionValue,
-    /// An enum option's value did not match any of its declared allowed values.
+    /// A declared option received a value it rejects: an enum option's
+    /// value matched none of its declared allowed values, or a boolean
+    /// flag's explicit `=value` was neither `true` nor `false`.
     InvalidOptionValue,
     /// A required positional argument was not supplied.
     MissingRequiredArgument,
@@ -526,6 +528,14 @@ enum OptionArity {
     Value,
 }
 
+/// The schema entry (if any) owning an `=value` spelling: a boolean flag,
+/// a string option, or an enum option.
+type EqualsCandidates<'a> = (
+    Option<&'a Flag>,
+    Option<&'a StringOption>,
+    Option<&'a EnumOption>,
+);
+
 /// A resolved CLI-facing help request, or none (fall through to version
 /// detection, then ordinary execution). Produced by `Command::resolve_help`.
 ///
@@ -591,8 +601,8 @@ fn probe_short(command: &Command, short: char) -> Result<Option<OptionArity>, Pa
 /// Determines whether `--name=value` is recognized by `command`, or
 /// transitively by its default-subcommand chain.
 fn probe_long_equals(command: &Command, name: &str) -> Result<bool, ParseError> {
-    let (string_match, enum_match) = command.long_equals_candidates(name)?;
-    if string_match.is_some() || enum_match.is_some() {
+    let (flag_match, string_match, enum_match) = command.long_equals_candidates(name)?;
+    if flag_match.is_some() || string_match.is_some() || enum_match.is_some() {
         return Ok(true);
     }
 
@@ -604,14 +614,29 @@ fn probe_long_equals(command: &Command, name: &str) -> Result<bool, ParseError> 
 
 /// Short-option counterpart to `probe_long_equals`.
 fn probe_short_equals(command: &Command, short: char) -> Result<bool, ParseError> {
-    let (string_match, enum_match) = command.short_equals_candidates(short)?;
-    if string_match.is_some() || enum_match.is_some() {
+    let (flag_match, string_match, enum_match) = command.short_equals_candidates(short)?;
+    if flag_match.is_some() || string_match.is_some() || enum_match.is_some() {
         return Ok(true);
     }
 
     match command.resolve_default_child()? {
         Some(next) => probe_short_equals(next, short),
         None => Ok(false),
+    }
+}
+
+/// Parses an explicit `=value` boolean literal. Ritty accepts only the exact
+/// lowercase strings `true`/`false` (unlike Citty v0.2.2, which treats any
+/// string other than `"false"` as true) so a typo is reported rather than
+/// silently coerced to `true`.
+fn parse_bool_literal(spelling: &str, value: &str) -> Result<bool, ParseError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ParseError::new(
+            ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue),
+            format!("invalid value for option: {spelling}: {value} (expected true or false)"),
+        )),
     }
 }
 
@@ -1157,10 +1182,9 @@ impl From<ParseError> for RunError {
 /// contributes setup/cleanup hooks that run alongside the command's own
 /// lifecycle. See [`Command::plugin`] for exact ordering.
 ///
-/// A `Plugin` is a concrete, cloneable value: because its hooks are backed
-/// by the same `Arc`-wrapped `Hook` used elsewhere, cloning a plugin to
-/// attach it to multiple commands shares its captured closure state rather
-/// than duplicating it.
+/// A `Plugin` is a concrete, cloneable value: because its lifecycle hooks
+/// are Arc-backed, cloning a plugin to attach it to multiple commands
+/// shares its captured closure state rather than duplicating it.
 #[derive(Debug, Clone)]
 pub struct Plugin {
     name: String,
@@ -1613,13 +1637,12 @@ impl Command {
         Ok(None)
     }
 
-    /// Resolves a `--name=value` long-option token to whichever value-bearing
-    /// schema entry owns `name`. Flags participate only in the ambiguity
-    /// count: `--flag=value` is never a valid spelling for a boolean flag.
-    fn long_equals_candidates(
-        &self,
-        name: &str,
-    ) -> Result<(Option<&StringOption>, Option<&EnumOption>), ParseError> {
+    /// Resolves a `--name=value` long-option token to whichever schema entry
+    /// owns `name`: a boolean flag, or a value-bearing string/enum option.
+    /// A `--no-*` negation participates only in the ambiguity count — an
+    /// explicit value is never valid for the negative spelling, so it is
+    /// never returned as a flag candidate here.
+    fn long_equals_candidates(&self, name: &str) -> Result<EqualsCandidates<'_>, ParseError> {
         let positive_flags = self.flags_matching_long(name);
         let negative_flags = name
             .strip_prefix("no-")
@@ -1641,16 +1664,14 @@ impl Command {
         }
 
         Ok((
+            positive_flags.first().copied(),
             string_candidates.first().copied(),
             enum_candidates.first().copied(),
         ))
     }
 
     /// Resolves a `-x=value` short-option token, mirroring `long_equals_candidates`.
-    fn short_equals_candidates(
-        &self,
-        short: char,
-    ) -> Result<(Option<&StringOption>, Option<&EnumOption>), ParseError> {
+    fn short_equals_candidates(&self, short: char) -> Result<EqualsCandidates<'_>, ParseError> {
         let flag_candidates = self.flags_matching_short(short);
         let string_candidates = self.options_matching_short(short);
         let enum_candidates = self.enum_options_matching_short(short);
@@ -1663,6 +1684,7 @@ impl Command {
         }
 
         Ok((
+            flag_candidates.first().copied(),
             string_candidates.first().copied(),
             enum_candidates.first().copied(),
         ))
@@ -2057,7 +2079,15 @@ impl Command {
             if !terminated {
                 if let Some(rest) = arg.strip_prefix("--") {
                     if let Some((name, value)) = rest.split_once('=') {
-                        let (string_match, enum_match) = self.long_equals_candidates(name)?;
+                        let (flag_match, string_match, enum_match) =
+                            self.long_equals_candidates(name)?;
+
+                        if let Some(flag) = flag_match {
+                            let parsed = parse_bool_literal(&format!("--{name}"), value)?;
+                            matches.set_flag(flag.name(), parsed);
+                            index += 1;
+                            continue;
+                        }
 
                         if let Some(option) = string_match {
                             matches
@@ -2156,7 +2186,15 @@ impl Command {
                 if let Some(rest) = arg.strip_prefix('-') {
                     if let Some((name, value)) = rest.split_once('=') {
                         if let Some(short) = single_char(name) {
-                            let (string_match, enum_match) = self.short_equals_candidates(short)?;
+                            let (flag_match, string_match, enum_match) =
+                                self.short_equals_candidates(short)?;
+
+                            if let Some(flag) = flag_match {
+                                let parsed = parse_bool_literal(&format!("-{short}"), value)?;
+                                matches.set_flag(flag.name(), parsed);
+                                index += 1;
+                                continue;
+                            }
 
                             if let Some(option) = string_match {
                                 matches
@@ -3447,6 +3485,371 @@ mod tests {
         let error = command.parse_from(["--no-c"]).unwrap_err();
 
         assert_eq!(error.message(), "unknown flag: --no-c");
+    }
+
+    // --- Boolean `=value` coercion ---
+
+    #[test]
+    fn canonical_long_boolean_equals_true() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let matches = command.parse_from(["--force=true"]).unwrap();
+
+        assert!(matches.flag("force"));
+    }
+
+    #[test]
+    fn canonical_long_boolean_equals_false() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let matches = command.parse_from(["--force=false"]).unwrap();
+
+        assert!(!matches.flag("force"));
+    }
+
+    #[test]
+    fn long_alias_boolean_equals_normalizes_to_canonical() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").alias("chatty"));
+
+        let matches = command.parse_from(["--chatty=true"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+
+        let matches = command.parse_from(["--chatty=false"]).unwrap();
+
+        assert!(!matches.flag("verbose"));
+    }
+
+    #[test]
+    fn dedicated_short_boolean_equals_true_and_false() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v'));
+
+        let matches = command.parse_from(["-v=true"]).unwrap();
+        assert!(matches.flag("verbose"));
+
+        let matches = command.parse_from(["-v=false"]).unwrap();
+        assert!(!matches.flag("verbose"));
+    }
+
+    #[test]
+    fn single_char_alias_boolean_equals_true_and_false() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").alias("q"));
+
+        let matches = command.parse_from(["-q=true"]).unwrap();
+        assert!(matches.flag("verbose"));
+
+        let matches = command.parse_from(["-q=false"]).unwrap();
+        assert!(!matches.flag("verbose"));
+    }
+
+    #[test]
+    fn explicit_boolean_equals_overrides_true_default() {
+        let command = Command::new("ritty").flag(Flag::new("install").default(true));
+
+        let matches = command.parse_from(["--install=false"]).unwrap();
+
+        assert!(!matches.flag("install"));
+    }
+
+    #[test]
+    fn explicit_boolean_equals_overrides_false_default() {
+        let command = Command::new("ritty").flag(Flag::new("install").default(false));
+
+        let matches = command.parse_from(["--install=true"]).unwrap();
+
+        assert!(matches.flag("install"));
+    }
+
+    #[test]
+    fn boolean_equals_false_then_bare_positive_yields_positive() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let matches = command.parse_from(["--force=false", "--force"]).unwrap();
+
+        assert!(matches.flag("force"));
+    }
+
+    #[test]
+    fn bare_positive_then_boolean_equals_false_yields_negative() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let matches = command.parse_from(["--force", "--force=false"]).unwrap();
+
+        assert!(!matches.flag("force"));
+    }
+
+    #[test]
+    fn negation_then_boolean_equals_true_yields_positive() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let matches = command.parse_from(["--no-force", "--force=true"]).unwrap();
+
+        assert!(matches.flag("force"));
+    }
+
+    #[test]
+    fn boolean_equals_true_then_negation_yields_negative() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let matches = command.parse_from(["--force=true", "--no-force"]).unwrap();
+
+        assert!(!matches.flag("force"));
+    }
+
+    #[test]
+    fn boolean_equals_rejects_yes() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let error = command.parse_from(["--force=yes"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue)
+        );
+        assert_eq!(
+            error.message(),
+            "invalid value for option: --force: yes (expected true or false)"
+        );
+    }
+
+    #[test]
+    fn boolean_equals_rejects_1() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let error = command.parse_from(["--force=1"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue)
+        );
+    }
+
+    #[test]
+    fn boolean_equals_rejects_uppercase_true() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let error = command.parse_from(["--force=TRUE"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue)
+        );
+    }
+
+    #[test]
+    fn boolean_equals_rejects_empty_value() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let error = command.parse_from(["--force="]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue)
+        );
+    }
+
+    #[test]
+    fn short_boolean_equals_invalid_value_reports_short_spelling() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v'));
+
+        let error = command.parse_from(["-v=yes"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::InvalidOptionValue)
+        );
+        assert_eq!(
+            error.message(),
+            "invalid value for option: -v: yes (expected true or false)"
+        );
+    }
+
+    #[test]
+    fn negated_boolean_equals_does_not_become_valid() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let error = command.parse_from(["--no-force=true"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption)
+        );
+        assert_eq!(error.message(), "unknown flag: --no-force");
+    }
+
+    #[test]
+    fn negated_boolean_equals_false_does_not_become_valid() {
+        let command = Command::new("ritty").flag(Flag::new("force"));
+
+        let error = command.parse_from(["--no-force=false"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption)
+        );
+    }
+
+    #[test]
+    fn boolean_equals_spelling_collides_with_string_option_remains_ambiguous() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("mode"))
+            .option(StringOption::new("mode"));
+
+        let error = command.parse_from(["--mode=true"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::AmbiguousOption)
+        );
+    }
+
+    #[test]
+    fn boolean_equals_spelling_collides_with_enum_option_remains_ambiguous() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("mode"))
+            .enum_option(EnumOption::new("mode", ["a", "b"]));
+
+        let error = command.parse_from(["--mode=true"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::AmbiguousOption)
+        );
+    }
+
+    #[test]
+    fn boolean_equals_reaches_direct_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").flag(Flag::new("force")));
+
+        let matches = command.parse_from(["--force=false"]).unwrap();
+
+        assert!(!matches.subcommand_matches().unwrap().flag("force"));
+    }
+
+    #[test]
+    fn boolean_equals_reaches_nested_default_subcommand_chain() {
+        let command = Command::new("root").default_subcommand("run").command(
+            Command::new("run")
+                .default_subcommand("fast")
+                .command(Command::new("fast").flag(Flag::new("force"))),
+        );
+
+        let matches = command.parse_from(["--force=true"]).unwrap();
+
+        assert!(
+            matches
+                .subcommand_matches()
+                .unwrap()
+                .subcommand_matches()
+                .unwrap()
+                .flag("force")
+        );
+    }
+
+    #[test]
+    fn long_alias_boolean_equals_reaches_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").flag(Flag::new("verbose").alias("chatty")));
+
+        let matches = command.parse_from(["--chatty=false"]).unwrap();
+
+        assert!(!matches.subcommand_matches().unwrap().flag("verbose"));
+    }
+
+    #[test]
+    fn short_boolean_equals_reaches_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").flag(Flag::new("verbose").short('v')));
+
+        let matches = command.parse_from(["-v=true"]).unwrap();
+
+        assert!(matches.subcommand_matches().unwrap().flag("verbose"));
+    }
+
+    #[test]
+    fn builtin_help_skips_boolean_long_equals_before_child() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("force"))
+            .command(Command::new("remote"));
+
+        let action = command
+            .run_cli_from(["--force=false", "remote", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty remote")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_help_skips_boolean_alias_long_equals_before_child() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("force").alias("f"))
+            .command(Command::new("remote"));
+
+        let action = command
+            .run_cli_from(["--f=false", "remote", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty remote")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn string_option_equals_syntax_still_works_alongside_boolean_equals() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("force"))
+            .option(StringOption::new("name"));
+
+        let matches = command
+            .parse_from(["--force=true", "--name=value"])
+            .unwrap();
+
+        assert!(matches.flag("force"));
+        assert_eq!(matches.option("name"), Some("value"));
+    }
+
+    #[test]
+    fn short_option_equals_syntax_still_works_alongside_boolean_equals() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("force").short('f'))
+            .option(StringOption::new("name").alias("n"));
+
+        let matches = command.parse_from(["-f=true", "-n=value"]).unwrap();
+
+        assert!(matches.flag("force"));
+        assert_eq!(matches.option("name"), Some("value"));
+    }
+
+    #[test]
+    fn missing_string_option_value_remains_strict_error() {
+        let command = Command::new("ritty").option(StringOption::new("output"));
+
+        let error = command.parse_from(["--output"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingOptionValue)
+        );
+    }
+
+    #[test]
+    fn missing_short_string_option_value_remains_strict_error() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
+
+        let error = command.parse_from(["-o"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::MissingOptionValue)
+        );
     }
 
     #[test]
