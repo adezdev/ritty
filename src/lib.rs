@@ -4,12 +4,27 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg {
     name: String,
+    required: bool,
 }
 
 impl Arg {
     /// Creates a new positional argument.
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            required: false,
+        }
+    }
+
+    /// Marks the argument as required.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Returns whether the argument is required.
+    pub fn is_required(&self) -> bool {
+        self.required
     }
 
     /// Returns the argument name.
@@ -225,6 +240,17 @@ impl Command {
             });
         }
 
+        if let Some(argument) = self
+            .arguments
+            .iter()
+            .skip(positional)
+            .find(|argument| argument.is_required())
+        {
+            return Err(ParseError {
+                message: format!("missing required argument: {}", argument.name()),
+            });
+        }
+
         Ok(matches)
     }
 
@@ -321,6 +347,69 @@ mod tests {
         let matches = command.parse_from(["world"]).unwrap();
 
         assert_eq!(matches.argument("name"), Some("world"));
+    }
+
+    #[test]
+    fn rejects_missing_required_argument() {
+        let command = Command::new("ritty").arg(Arg::new("name").required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required argument: name");
+    }
+
+    #[test]
+    fn accepts_required_argument_when_supplied() {
+        let command = Command::new("ritty").arg(Arg::new("name").required());
+
+        let matches = command.parse_from(["world"]).unwrap();
+
+        assert_eq!(matches.argument("name"), Some("world"));
+    }
+
+    #[test]
+    fn parses_multiple_positional_arguments_in_order() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("first").required())
+            .arg(Arg::new("second").required());
+
+        let matches = command.parse_from(["one", "two"]).unwrap();
+
+        assert_eq!(matches.argument("first"), Some("one"));
+        assert_eq!(matches.argument("second"), Some("two"));
+    }
+
+    #[test]
+    fn rejects_missing_later_required_argument() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("first"))
+            .arg(Arg::new("second").required());
+
+        let error = command.parse_from(["one"]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required argument: second");
+    }
+
+    #[test]
+    fn flag_does_not_satisfy_required_argument() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("name").required())
+            .flag(Flag::new("verbose"));
+
+        let error = command.parse_from(["--verbose"]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required argument: name");
+    }
+
+    #[test]
+    fn subcommand_does_not_satisfy_required_argument() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("name").required())
+            .command(Command::new("build"));
+
+        let error = command.parse_from(["build"]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required argument: name");
     }
 
     #[test]
