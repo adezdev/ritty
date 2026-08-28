@@ -526,6 +526,32 @@ enum OptionArity {
     Value,
 }
 
+/// A resolved CLI-facing built-in request, or none (fall through to ordinary
+/// execution). Produced by `Command::resolve_builtin`.
+enum Builtin<'a> {
+    /// A help request targeting `command`, reachable from the root as
+    /// `display_name` (space-separated, canonical names only).
+    Help {
+        command: &'a Command,
+        display_name: String,
+        inherited_version: Option<&'a str>,
+    },
+    /// A version request; `None` when the resolved command has no version
+    /// of its own and inherits none from an ancestor.
+    Version(Option<&'a str>),
+    /// No built-in was requested.
+    None,
+}
+
+/// The outcome of `Command::run_cli_from`: a rendered built-in response
+/// ready to print, or confirmation that ordinary execution already ran.
+#[derive(Debug)]
+enum CliAction {
+    Help(String),
+    Version(String),
+    Ran,
+}
+
 /// Determines whether `name` is recognized as a bare long option by
 /// `command`, or transitively by its default-subcommand chain, and if so
 /// with what arity. Used to decide, at the level currently being parsed, how
@@ -999,6 +1025,11 @@ pub enum RunError {
         /// The original error returned by the plugin's cleanup hook.
         source: BoxError,
     },
+    /// A built-in `--version`/`-v` request resolved to a command that
+    /// declares no version and inherits none from an ancestor.
+    NoVersion,
+    /// Writing a built-in help/version response to stdout failed.
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -1015,6 +1046,8 @@ impl std::fmt::Display for RunError {
             RunError::PluginCleanup { plugin, source } => {
                 write!(f, "plugin {plugin} cleanup failed: {source}")
             }
+            RunError::NoVersion => f.write_str("no version specified"),
+            RunError::Io(err) => write!(f, "{err}"),
         }
     }
 }
@@ -1029,6 +1062,8 @@ impl std::error::Error for RunError {
             RunError::Cleanup(err) => Some(err.as_ref()),
             RunError::PluginSetup { source, .. } => Some(source.as_ref()),
             RunError::PluginCleanup { source, .. } => Some(source.as_ref()),
+            RunError::NoVersion => None,
+            RunError::Io(err) => Some(err),
         }
     }
 }
@@ -1405,6 +1440,23 @@ impl Command {
             .collect()
     }
 
+    /// Whether this command's own schema (a flag, string option, or enum
+    /// option — canonical name or alias) already claims the long spelling
+    /// `--{name}`, independent of arity. Used to decide whether a built-in
+    /// like `--help` would collide with a user-declared option.
+    fn owns_long(&self, name: &str) -> bool {
+        !self.flags_matching_long(name).is_empty()
+            || !self.options_matching_long(name).is_empty()
+            || !self.enum_options_matching_long(name).is_empty()
+    }
+
+    /// Short-option counterpart to `owns_long`.
+    fn owns_short(&self, short: char) -> bool {
+        !self.flags_matching_short(short).is_empty()
+            || !self.options_matching_short(short).is_empty()
+            || !self.enum_options_matching_short(short).is_empty()
+    }
+
     /// Resolves a bare long-option token (no `--` prefix, no `=`) against
     /// declared flags (positive and `no-*` negation) and string options,
     /// erroring on ambiguity rather than silently preferring one schema.
@@ -1587,6 +1639,171 @@ impl Command {
     {
         let matches = self.parse_from(args)?;
         self.execute(&matches, &matches)
+    }
+
+    /// Whether the long spelling `--{long_name}` is available as a CLI
+    /// built-in for this command. Declaring `long_name` itself (canonical or
+    /// alias) disables both the long and short built-in spellings, so this
+    /// only checks long ownership.
+    fn builtin_long_enabled(&self, long_name: &str) -> bool {
+        !self.owns_long(long_name)
+    }
+
+    /// Whether the short spelling `-{short}` is available as a CLI built-in
+    /// for this command. Disabled by owning either the long name itself or
+    /// the short spelling.
+    fn builtin_short_enabled(&self, long_name: &str, short: char) -> bool {
+        !self.owns_long(long_name) && !self.owns_short(short)
+    }
+
+    /// Walks `args` against this command tree looking for a built-in
+    /// `--help`/`-h`/`--version`/`-v` request, without running the ordinary
+    /// parser (which would reject an undeclared `--help`/`--version` as an
+    /// unknown option). Reuses `probe_long`/`probe_short`'s option-arity
+    /// knowledge to skip over parent option values correctly, and follows
+    /// only explicit subcommand tokens — never a default-subcommand chain —
+    /// so a bare `--help` never silently targets a default child.
+    fn resolve_builtin<'a>(&'a self, args: &[String]) -> Result<Builtin<'a>, ParseError> {
+        let mut command = self;
+        let mut display_name = self.name().to_owned();
+        let mut inherited_version: Option<&'a str> = None;
+        let mut terminated = false;
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index].as_str();
+
+            if !terminated && arg == "--" {
+                terminated = true;
+                index += 1;
+                continue;
+            }
+
+            if terminated {
+                index += 1;
+                continue;
+            }
+
+            if arg == "--help" && command.builtin_long_enabled("help") {
+                return Ok(Builtin::Help {
+                    command,
+                    display_name,
+                    inherited_version,
+                });
+            }
+
+            if arg == "-h" && command.builtin_short_enabled("help", 'h') {
+                return Ok(Builtin::Help {
+                    command,
+                    display_name,
+                    inherited_version,
+                });
+            }
+
+            if arg == "--version" && command.builtin_long_enabled("version") {
+                return Ok(Builtin::Version(
+                    command.version.as_deref().or(inherited_version),
+                ));
+            }
+
+            if arg == "-v" && command.builtin_short_enabled("version", 'v') {
+                return Ok(Builtin::Version(
+                    command.version.as_deref().or(inherited_version),
+                ));
+            }
+
+            if let Some(rest) = arg.strip_prefix("--") {
+                if rest.contains('=') {
+                    index += 1;
+                    continue;
+                }
+
+                index += match probe_long(command, rest)? {
+                    Some(OptionArity::Value) => 2,
+                    Some(OptionArity::Flag) | None => 1,
+                };
+                continue;
+            }
+
+            if let Some(rest) = arg.strip_prefix('-') {
+                if rest.contains('=') {
+                    index += 1;
+                    continue;
+                }
+
+                let arity = single_char(rest)
+                    .map(|short| probe_short(command, short))
+                    .transpose()?
+                    .flatten();
+
+                index += match arity {
+                    Some(OptionArity::Value) => 2,
+                    Some(OptionArity::Flag) | None => 1,
+                };
+                continue;
+            }
+
+            let candidates = command.subcommands_matching(arg);
+            if let [next] = candidates[..] {
+                inherited_version = command.version.as_deref().or(inherited_version);
+                display_name.push(' ');
+                display_name.push_str(next.name());
+                command = next;
+            }
+
+            index += 1;
+        }
+
+        Ok(Builtin::None)
+    }
+
+    /// Resolves built-ins against `args`, falling through to literal
+    /// `run_from`-equivalent execution when none apply. Kept separate from
+    /// `run()` so the CLI dispatcher is testable without touching
+    /// `std::env::args`.
+    fn run_cli_from<I, S>(&self, args: I) -> Result<CliAction, RunError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
+
+        match self.resolve_builtin(&args)? {
+            Builtin::Help {
+                command,
+                display_name,
+                inherited_version,
+            } => Ok(CliAction::Help(
+                command.render_usage_named(&display_name, inherited_version),
+            )),
+            Builtin::Version(Some(version)) => Ok(CliAction::Version(version.to_owned())),
+            Builtin::Version(None) => Err(RunError::NoVersion),
+            Builtin::None => {
+                self.run_from(args)?;
+                Ok(CliAction::Ran)
+            }
+        }
+    }
+
+    /// Runs the command against the current process's argv (`argv[1..]`),
+    /// intercepting built-in `--help`/`-h`/`--version`/`-v` requests before
+    /// ordinary parsing/execution begins — so a successful built-in request
+    /// runs zero handler, setup, cleanup, or plugin hooks. `run_from` remains
+    /// the literal, programmatic counterpart and never special-cases these
+    /// spellings.
+    pub fn run(&self) -> Result<(), RunError> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+
+        match self.run_cli_from(args)? {
+            CliAction::Help(text) | CliAction::Version(text) => {
+                use std::io::Write;
+                writeln!(std::io::stdout(), "{text}").map_err(RunError::Io)
+            }
+            CliAction::Ran => Ok(()),
+        }
     }
 
     /// Executes the command selected by `matches`, recursing into a selected
@@ -7454,5 +7671,580 @@ mod tests {
         assert!(
             matches!(cleanup_error, RunError::PluginCleanup { plugin, .. } if plugin == "logger")
         );
+    }
+
+    // --- Built-ins ---
+
+    fn assert_help(action: CliAction, expected: &str) {
+        match action {
+            CliAction::Help(text) => assert_eq!(text, expected),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    fn assert_version(action: CliAction, expected: &str) {
+        match action {
+            CliAction::Version(text) => assert_eq!(text, expected),
+            _ => panic!("expected CliAction::Version"),
+        }
+    }
+
+    #[test]
+    fn builtin_long_help_renders_root_usage() {
+        let command = Command::new("ritty").description("desc");
+
+        let action = command.run_cli_from(["--help"]).unwrap();
+
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn builtin_short_help_renders_root_usage() {
+        let command = Command::new("ritty").description("desc");
+
+        let action = command.run_cli_from(["-h"]).unwrap();
+
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn builtin_help_runs_zero_lifecycle_callbacks() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler_calls = Arc::clone(&calls);
+        let setup_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let plugin_setup_calls = Arc::clone(&calls);
+        let plugin_cleanup_calls = Arc::clone(&calls);
+
+        let command = Command::new("ritty")
+            .plugin(
+                Plugin::new("p")
+                    .setup(move |_ctx| {
+                        plugin_setup_calls.lock().unwrap().push("plugin_setup");
+                        Ok(())
+                    })
+                    .cleanup(move |_ctx| {
+                        plugin_cleanup_calls.lock().unwrap().push("plugin_cleanup");
+                        Ok(())
+                    }),
+            )
+            .setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            })
+            .handler(move |_ctx| {
+                handler_calls.lock().unwrap().push("handler");
+                Ok(())
+            });
+
+        command.run_cli_from(["--help"]).unwrap();
+
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn builtin_version_runs_zero_lifecycle_callbacks() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler_calls = Arc::clone(&calls);
+        let setup_calls = Arc::clone(&calls);
+
+        let command = Command::new("ritty")
+            .version("1.0.0")
+            .setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .handler(move |_ctx| {
+                handler_calls.lock().unwrap().push("handler");
+                Ok(())
+            });
+
+        command.run_cli_from(["--version"]).unwrap();
+
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn builtin_nested_help_renders_qualified_child_usage() {
+        let add = Command::new("add");
+        let remote = Command::new("remote").command(add);
+        let command = Command::new("ritty").command(remote);
+
+        let action = command.run_cli_from(["remote", "add", "--help"]).unwrap();
+
+        let expected = command
+            .subcommands
+            .iter()
+            .find(|c| c.name() == "remote")
+            .unwrap()
+            .subcommands
+            .iter()
+            .find(|c| c.name() == "add")
+            .unwrap()
+            .render_usage_named("ritty remote add", None);
+        assert_help(action, &expected);
+    }
+
+    #[test]
+    fn builtin_deeply_nested_help_renders_qualified_usage() {
+        let leaf = Command::new("leaf");
+        let mid = Command::new("mid").command(leaf);
+        let top = Command::new("top").command(mid);
+        let command = Command::new("ritty").command(top);
+
+        let action = command
+            .run_cli_from(["top", "mid", "leaf", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty top mid leaf")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_subcommand_alias_help_renders_canonical_path() {
+        let command = Command::new("ritty").command(Command::new("install").alias("i"));
+
+        let action = command.run_cli_from(["i", "--help"]).unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty install")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_hidden_subcommand_help_still_resolves() {
+        let command = Command::new("ritty").command(Command::new("secret").hidden());
+
+        let action = command.run_cli_from(["secret", "--help"]).unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty secret")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_help_qualified_display_name_matches_render_usage_named() {
+        let command = Command::new("ritty").command(Command::new("remote"));
+
+        let action = command.run_cli_from(["remote", "--help"]).unwrap();
+
+        let remote = command
+            .subcommands
+            .iter()
+            .find(|c| c.name() == "remote")
+            .unwrap();
+        assert_help(action, &remote.render_usage_named("ritty remote", None));
+    }
+
+    #[test]
+    fn builtin_help_skips_parent_string_option_value_before_child() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("config"))
+            .command(Command::new("remote"));
+
+        let action = command
+            .run_cli_from(["--config", "production", "remote", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty remote")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_help_skips_parent_enum_option_value_before_child() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("mode", ["a", "b"]))
+            .command(Command::new("remote"));
+
+        let action = command
+            .run_cli_from(["--mode", "remote", "remote", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty remote")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_help_skips_short_value_bearing_option_before_child() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("config").alias("c"))
+            .command(Command::new("remote"));
+
+        let action = command
+            .run_cli_from(["-c", "remote", "remote", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty remote")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_help_skips_long_equals_value_before_child() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("config"))
+            .command(Command::new("remote"));
+
+        let action = command
+            .run_cli_from(["--config=remote", "remote", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty remote")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    #[test]
+    fn builtin_help_skips_short_equals_value_before_child() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("config").alias("c"))
+            .command(Command::new("remote"));
+
+        let action = command
+            .run_cli_from(["-c=remote", "remote", "--help"])
+            .unwrap();
+
+        match action {
+            CliAction::Help(text) => assert!(text.contains("ritty remote")),
+            _ => panic!("expected CliAction::Help"),
+        }
+    }
+
+    // --- Help conflicts ---
+
+    #[test]
+    fn user_defined_canonical_help_disables_builtin_entirely() {
+        let command = Command::new("ritty").flag(Flag::new("help"));
+
+        let action = command.run_cli_from(["--help"]).unwrap();
+        match action {
+            CliAction::Ran => {}
+            _ => panic!("expected --help to parse as the user's own flag"),
+        }
+
+        let error = command.run_cli_from(["-h"]).unwrap_err();
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn user_defined_long_alias_help_disables_builtin_entirely() {
+        let command = Command::new("ritty").flag(Flag::new("assist").alias("help"));
+
+        let action = command.run_cli_from(["--help"]).unwrap();
+        assert!(matches!(action, CliAction::Ran));
+
+        let error = command.run_cli_from(["-h"]).unwrap_err();
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn user_owned_short_h_disables_only_short_builtin() {
+        let command = Command::new("ritty").flag(Flag::new("host").short('h'));
+
+        let action = command.run_cli_from(["-h"]).unwrap();
+        assert!(matches!(action, CliAction::Ran));
+
+        let action = command.run_cli_from(["--help"]).unwrap();
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn help_remains_when_only_short_conflicts() {
+        let command = Command::new("ritty").flag(Flag::new("host").short('h'));
+
+        let action = command.run_cli_from(["--help"]).unwrap();
+
+        assert_help(action, &command.render_usage());
+    }
+
+    #[test]
+    fn normal_execution_occurs_for_user_owned_help_spelling() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("ritty")
+            .flag(Flag::new("host").short('h'))
+            .handler(move |ctx| {
+                recorded.lock().unwrap().push(ctx.matches().flag("host"));
+                Ok(())
+            });
+
+        let action = command.run_cli_from(["-h"]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(*calls.lock().unwrap(), vec![true]);
+    }
+
+    // --- Version ---
+
+    #[test]
+    fn builtin_long_version_prints_exact_version() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        let action = command.run_cli_from(["--version"]).unwrap();
+
+        assert_version(action, "1.2.3");
+    }
+
+    #[test]
+    fn builtin_short_version_prints_exact_version() {
+        let command = Command::new("ritty").version("1.2.3");
+
+        let action = command.run_cli_from(["-v"]).unwrap();
+
+        assert_version(action, "1.2.3");
+    }
+
+    #[test]
+    fn missing_version_is_no_version_error() {
+        let command = Command::new("ritty");
+
+        let error = command.run_cli_from(["--version"]).unwrap_err();
+
+        assert!(matches!(error, RunError::NoVersion));
+    }
+
+    #[test]
+    fn no_version_display_and_source() {
+        let error = RunError::NoVersion;
+
+        assert_eq!(error.to_string(), "no version specified");
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn user_defined_canonical_version_disables_builtin_entirely() {
+        let command = Command::new("ritty")
+            .version("1.2.3")
+            .flag(Flag::new("version"));
+
+        let action = command.run_cli_from(["--version"]).unwrap();
+        assert!(matches!(action, CliAction::Ran));
+
+        let error = command.run_cli_from(["-v"]).unwrap_err();
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn user_defined_long_alias_version_disables_builtin_entirely() {
+        let command = Command::new("ritty")
+            .version("1.2.3")
+            .flag(Flag::new("verbose").alias("version"));
+
+        let action = command.run_cli_from(["--version"]).unwrap();
+        assert!(matches!(action, CliAction::Ran));
+
+        let error = command.run_cli_from(["-v"]).unwrap_err();
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn user_owned_short_v_disables_only_short_builtin() {
+        let command = Command::new("ritty")
+            .version("1.2.3")
+            .flag(Flag::new("verbose").short('v'));
+
+        let action = command.run_cli_from(["-v"]).unwrap();
+        assert!(matches!(action, CliAction::Ran));
+
+        let action = command.run_cli_from(["--version"]).unwrap();
+        assert_version(action, "1.2.3");
+    }
+
+    #[test]
+    fn version_remains_when_only_short_conflicts() {
+        let command = Command::new("ritty")
+            .version("1.2.3")
+            .flag(Flag::new("verbose").short('v'));
+
+        let action = command.run_cli_from(["--version"]).unwrap();
+
+        assert_version(action, "1.2.3");
+    }
+
+    // --- API separation ---
+
+    #[test]
+    fn parse_from_help_remains_literal() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["--help"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption)
+        );
+    }
+
+    #[test]
+    fn run_from_help_remains_literal() {
+        let command = Command::new("ritty").handler(|_ctx| Ok(()));
+
+        let error = command.run_from(["--help"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_from_version_remains_literal() {
+        let command = Command::new("ritty").version("1.0.0");
+
+        let error = command.parse_from(["--version"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption)
+        );
+    }
+
+    #[test]
+    fn run_from_version_remains_literal() {
+        let command = Command::new("ritty")
+            .version("1.0.0")
+            .handler(|_ctx| Ok(()));
+
+        let error = command.run_from(["--version"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn cli_dispatcher_recognizes_builtins() {
+        let command = Command::new("ritty").version("1.0.0");
+
+        assert!(matches!(
+            command.run_cli_from(["--help"]).unwrap(),
+            CliAction::Help(_)
+        ));
+        assert!(matches!(
+            command.run_cli_from(["--version"]).unwrap(),
+            CliAction::Version(_)
+        ));
+    }
+
+    // --- Regression: normal CLI execution ---
+
+    #[test]
+    fn cli_dispatcher_runs_explicit_subcommand_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("ritty").command(Command::new("build").handler(move |_ctx| {
+            recorded.lock().unwrap().push("build");
+            Ok(())
+        }));
+
+        let action = command.run_cli_from(["build"]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(*calls.lock().unwrap(), vec!["build"]);
+    }
+
+    #[test]
+    fn cli_dispatcher_runs_alias_subcommand_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("ritty").command(Command::new("install").alias("i").handler(
+            move |_ctx| {
+                recorded.lock().unwrap().push("install");
+                Ok(())
+            },
+        ));
+
+        let action = command.run_cli_from(["i"]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(*calls.lock().unwrap(), vec!["install"]);
+    }
+
+    #[test]
+    fn cli_dispatcher_runs_default_subcommand_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("ritty").default_subcommand("build").command(
+            Command::new("build").handler(move |_ctx| {
+                recorded.lock().unwrap().push("build");
+                Ok(())
+            }),
+        );
+
+        let action = command.run_cli_from([] as [&str; 0]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(*calls.lock().unwrap(), vec!["build"]);
+    }
+
+    #[test]
+    fn cli_dispatcher_runs_hidden_subcommand_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command =
+            Command::new("ritty").command(Command::new("secret").hidden().handler(move |_ctx| {
+                recorded.lock().unwrap().push("secret");
+                Ok(())
+            }));
+
+        let action = command.run_cli_from(["secret"]).unwrap();
+
+        assert!(matches!(action, CliAction::Ran));
+        assert_eq!(*calls.lock().unwrap(), vec!["secret"]);
+    }
+
+    #[test]
+    fn cli_dispatcher_runs_setup_and_cleanup() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let cleanup_calls = Arc::clone(&calls);
+        let command = Command::new("ritty")
+            .setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("setup");
+                Ok(())
+            })
+            .cleanup(move |_ctx| {
+                cleanup_calls.lock().unwrap().push("cleanup");
+                Ok(())
+            })
+            .handler(|_ctx| Ok(()));
+
+        command.run_cli_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["setup", "cleanup"]);
+    }
+
+    #[test]
+    fn cli_dispatcher_runs_plugins() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let setup_calls = Arc::clone(&calls);
+        let command = Command::new("ritty")
+            .plugin(Plugin::new("p").setup(move |_ctx| {
+                setup_calls.lock().unwrap().push("plugin_setup");
+                Ok(())
+            }))
+            .handler(|_ctx| Ok(()));
+
+        command.run_cli_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["plugin_setup"]);
+    }
+
+    #[test]
+    fn cli_dispatcher_surfaces_parse_errors() {
+        let command = Command::new("ritty");
+
+        let error = command.run_cli_from(["--bogus"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
     }
 }
