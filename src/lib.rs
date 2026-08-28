@@ -76,6 +76,7 @@ impl Arg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringOption {
     name: String,
+    aliases: Vec<String>,
     description: Option<String>,
     value_hint: Option<String>,
     required: bool,
@@ -87,11 +88,24 @@ impl StringOption {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            aliases: Vec::new(),
             description: None,
             value_hint: None,
             required: false,
             default: None,
         }
+    }
+
+    /// Adds an alias. A single-character alias can also be used as a short
+    /// option (`-o`); a multi-character alias is a long-option alias (`--destination`).
+    pub fn alias(mut self, alias: impl Into<String>) -> Self {
+        self.aliases.push(alias.into());
+        self
+    }
+
+    /// Returns the option's aliases, in insertion order.
+    pub fn aliases(&self) -> &[String] {
+        &self.aliases
     }
 
     /// Sets the option description.
@@ -309,6 +323,27 @@ impl Command {
         &self.options
     }
 
+    /// Returns every string option whose canonical name or an alias matches `name`.
+    fn options_matching_long(&self, name: &str) -> Vec<&StringOption> {
+        self.options
+            .iter()
+            .filter(|option| option.name() == name || option.aliases().iter().any(|a| a == name))
+            .collect()
+    }
+
+    /// Returns every string option that declares `short` as a single-character alias.
+    fn options_matching_short(&self, short: char) -> Vec<&StringOption> {
+        self.options
+            .iter()
+            .filter(|option| {
+                option
+                    .aliases()
+                    .iter()
+                    .any(|alias| alias.len() == 1 && alias.starts_with(short))
+            })
+            .collect()
+    }
+
     /// Parses command-line arguments.
     pub fn parse_from<I, S>(&self, args: I) -> Result<Matches, ParseError>
     where
@@ -334,8 +369,17 @@ impl Command {
 
             if let Some(rest) = arg.strip_prefix("--") {
                 if let Some((name, value)) = rest.split_once('=') {
-                    if self.options.iter().any(|option| option.name() == name) {
-                        matches.options.push((name.to_owned(), value.to_owned()));
+                    let candidates = self.options_matching_long(name);
+                    if candidates.len() > 1 {
+                        return Err(ParseError {
+                            message: format!("ambiguous option: --{name}"),
+                        });
+                    }
+
+                    if let Some(option) = candidates.first() {
+                        matches
+                            .options
+                            .push((option.name().to_owned(), value.to_owned()));
                         index += 1;
                         continue;
                     }
@@ -353,11 +397,20 @@ impl Command {
                     continue;
                 }
 
-                if self.options.iter().any(|option| option.name() == name) {
+                let candidates = self.options_matching_long(name);
+                if candidates.len() > 1 {
+                    return Err(ParseError {
+                        message: format!("ambiguous option: --{name}"),
+                    });
+                }
+
+                if let Some(option) = candidates.first() {
                     let value = args.get(index + 1).ok_or_else(|| ParseError {
                         message: format!("missing value for option: --{name}"),
                     })?;
-                    matches.options.push((name.to_owned(), value.to_owned()));
+                    matches
+                        .options
+                        .push((option.name().to_owned(), value.to_owned()));
                     index += 2;
                     continue;
                 }
@@ -367,23 +420,66 @@ impl Command {
                 });
             }
 
-            if let Some(short) = arg.strip_prefix('-') {
-                if short.len() == 1 {
-                    let short = short.chars().next().unwrap();
+            if let Some(rest) = arg.strip_prefix('-') {
+                if let Some((name, value)) = rest.split_once('=') {
+                    if name.len() == 1 {
+                        let short = name.chars().next().unwrap();
+                        let candidates = self.options_matching_short(short);
 
-                    if let Some(flag) = self
+                        if candidates.len() > 1 {
+                            return Err(ParseError {
+                                message: format!("ambiguous option: -{short}"),
+                            });
+                        }
+
+                        if let Some(option) = candidates.first() {
+                            matches
+                                .options
+                                .push((option.name().to_owned(), value.to_owned()));
+                            index += 1;
+                            continue;
+                        }
+                    }
+
+                    return Err(ParseError {
+                        message: format!("unknown flag: -{rest}"),
+                    });
+                }
+
+                if rest.len() == 1 {
+                    let short = rest.chars().next().unwrap();
+                    let flag_match = self
                         .flags
                         .iter()
-                        .find(|flag| flag.short_name() == Some(short))
-                    {
+                        .find(|flag| flag.short_name() == Some(short));
+                    let option_candidates = self.options_matching_short(short);
+
+                    if option_candidates.len() + usize::from(flag_match.is_some()) > 1 {
+                        return Err(ParseError {
+                            message: format!("ambiguous option: -{short}"),
+                        });
+                    }
+
+                    if let Some(flag) = flag_match {
                         matches.flags.push(flag.name().to_owned());
                         index += 1;
+                        continue;
+                    }
+
+                    if let Some(option) = option_candidates.first() {
+                        let value = args.get(index + 1).ok_or_else(|| ParseError {
+                            message: format!("missing value for option: -{short}"),
+                        })?;
+                        matches
+                            .options
+                            .push((option.name().to_owned(), value.to_owned()));
+                        index += 2;
                         continue;
                     }
                 }
 
                 return Err(ParseError {
-                    message: format!("unknown flag: -{short}"),
+                    message: format!("unknown flag: -{rest}"),
                 });
             }
 
@@ -990,5 +1086,241 @@ mod tests {
 
         assert_eq!(matches.option("name"), Some("world"));
         assert_eq!(matches.argument("target"), Some("value"));
+    }
+
+    #[test]
+    fn canonical_string_option_repeated_uses_first_occurrence() {
+        // Established parser behavior: `Matches::option` looks up the
+        // first stored occurrence, so the first explicit value wins.
+        let command = Command::new("ritty").option(StringOption::new("output"));
+
+        let matches = command
+            .parse_from(["--output", "first", "--output", "second"])
+            .unwrap();
+
+        assert_eq!(matches.option("output"), Some("first"));
+    }
+
+    #[test]
+    fn string_option_aliases_default_to_empty() {
+        let option = StringOption::new("output");
+
+        assert!(option.aliases().is_empty());
+    }
+
+    #[test]
+    fn string_option_retains_aliases_in_order() {
+        let option = StringOption::new("output").alias("o").alias("out");
+
+        assert_eq!(option.aliases(), ["o", "out"]);
+    }
+
+    #[test]
+    fn parses_short_string_option_alias() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
+
+        let matches = command.parse_from(["-o", "dist"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("dist"));
+    }
+
+    #[test]
+    fn parses_short_string_option_alias_with_equals() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
+
+        let matches = command.parse_from(["-o=dist"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("dist"));
+    }
+
+    #[test]
+    fn short_string_option_alias_equals_value_preserves_extra_equals() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
+
+        let matches = command.parse_from(["-o=a=b"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("a=b"));
+    }
+
+    #[test]
+    fn short_string_option_alias_equals_empty_value_is_explicit() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
+
+        let matches = command.parse_from(["-o="]).unwrap();
+
+        assert_eq!(matches.option("output"), Some(""));
+    }
+
+    #[test]
+    fn canonical_long_option_equals_empty_value_is_explicit() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        let matches = command.parse_from(["--name="]).unwrap();
+
+        assert_eq!(matches.option("name"), Some(""));
+    }
+
+    #[test]
+    fn short_string_option_alias_consumes_hyphen_prefixed_value() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
+
+        let matches = command.parse_from(["-o", "--literal"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("--literal"));
+    }
+
+    #[test]
+    fn parses_long_string_option_alias() {
+        let command =
+            Command::new("ritty").option(StringOption::new("output").alias("destination"));
+
+        let matches = command.parse_from(["--destination", "dist"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("dist"));
+    }
+
+    #[test]
+    fn parses_long_string_option_alias_with_equals() {
+        let command =
+            Command::new("ritty").option(StringOption::new("output").alias("destination"));
+
+        let matches = command.parse_from(["--destination=dist"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("dist"));
+    }
+
+    #[test]
+    fn all_alias_spellings_resolve_to_canonical_name() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("output").alias("o").alias("destination"));
+
+        for args in [
+            &["--output", "dist"][..],
+            &["-o", "dist"][..],
+            &["-o=dist"][..],
+            &["--destination", "dist"][..],
+            &["--destination=dist"][..],
+        ] {
+            let matches = command.parse_from(args.to_vec()).unwrap();
+            assert_eq!(matches.option("output"), Some("dist"));
+        }
+    }
+
+    #[test]
+    fn short_string_option_alias_overrides_default() {
+        let command =
+            Command::new("ritty").option(StringOption::new("output").alias("o").default("default"));
+
+        let matches = command.parse_from(["-o", "explicit"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("explicit"));
+    }
+
+    #[test]
+    fn short_string_option_alias_equals_overrides_default() {
+        let command =
+            Command::new("ritty").option(StringOption::new("output").alias("o").default("default"));
+
+        let matches = command.parse_from(["-o=explicit"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("explicit"));
+    }
+
+    #[test]
+    fn required_string_option_satisfied_through_short_alias() {
+        let command =
+            Command::new("ritty").option(StringOption::new("output").required().alias("o"));
+
+        let matches = command.parse_from(["-o", "dist"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("dist"));
+    }
+
+    #[test]
+    fn string_option_alias_value_is_not_mistaken_for_subcommand() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("target").alias("t"))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["-t", "build"]).unwrap();
+
+        assert_eq!(matches.option("target"), Some("build"));
+        assert_eq!(matches.subcommand(), None);
+    }
+
+    #[test]
+    fn subcommand_resolves_after_string_option_alias_value() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("target").alias("t"))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["-t", "release", "build"]).unwrap();
+
+        assert_eq!(matches.option("target"), Some("release"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn string_option_alias_value_does_not_advance_positional_cursor() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("output").alias("o"))
+            .arg(Arg::new("target"));
+
+        let matches = command.parse_from(["-o", "dist", "world"]).unwrap();
+
+        assert_eq!(matches.option("output"), Some("dist"));
+        assert_eq!(matches.argument("target"), Some("world"));
+    }
+
+    #[test]
+    fn rejects_unknown_short_string_option_alias() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["-x"]).unwrap_err();
+
+        assert_eq!(error.message(), "unknown flag: -x");
+    }
+
+    #[test]
+    fn rejects_unknown_long_string_option_alias() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["--destination"]).unwrap_err();
+
+        assert_eq!(error.message(), "unknown flag: --destination");
+    }
+
+    #[test]
+    fn boolean_short_flag_still_works_alongside_string_option_aliases() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose").short('v'))
+            .option(StringOption::new("output").alias("o"));
+
+        let matches = command.parse_from(["-v", "-o", "dist"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+        assert_eq!(matches.option("output"), Some("dist"));
+    }
+
+    #[test]
+    fn boolean_short_flag_and_string_option_alias_collision_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose").short('v'))
+            .option(StringOption::new("value").alias("v"));
+
+        let error = command.parse_from(["-v"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: -v");
+    }
+
+    #[test]
+    fn duplicate_string_option_alias_collision_errors() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("first").alias("x"))
+            .option(StringOption::new("second").alias("x"));
+
+        let error = command.parse_from(["-x", "value"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: -x");
     }
 }
