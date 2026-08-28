@@ -72,6 +72,24 @@ impl Arg {
     }
 }
 
+/// A named string option in a Ritty command, e.g. `--name value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringOption {
+    name: String,
+}
+
+impl StringOption {
+    /// Creates a new string option.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    /// Returns the option name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// A boolean flag in a Ritty command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
@@ -110,6 +128,7 @@ impl Flag {
 pub struct Matches {
     flags: Vec<String>,
     arguments: Vec<(String, String)>,
+    options: Vec<(String, String)>,
     subcommand: Option<String>,
 }
 
@@ -124,6 +143,14 @@ impl Matches {
         self.arguments
             .iter()
             .find(|(argument, _)| argument == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Returns the value of a string option.
+    pub fn option(&self, name: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|(option, _)| option == name)
             .map(|(_, value)| value.as_str())
     }
 
@@ -155,6 +182,7 @@ pub struct Command {
     subcommands: Vec<Command>,
     arguments: Vec<Arg>,
     flags: Vec<Flag>,
+    options: Vec<StringOption>,
 }
 
 impl Command {
@@ -167,6 +195,7 @@ impl Command {
             subcommands: Vec::new(),
             arguments: Vec::new(),
             flags: Vec::new(),
+            options: Vec::new(),
         }
     }
 
@@ -215,6 +244,17 @@ impl Command {
         &self.flags
     }
 
+    /// Adds a string option.
+    pub fn option(mut self, option: StringOption) -> Self {
+        self.options.push(option);
+        self
+    }
+
+    /// Returns the command's string options.
+    pub fn options(&self) -> &[StringOption] {
+        &self.options
+    }
+
     /// Parses command-line arguments.
     pub fn parse_from<I, S>(&self, args: I) -> Result<Matches, ParseError>
     where
@@ -224,16 +264,47 @@ impl Command {
         let mut matches = Matches {
             flags: Vec::new(),
             arguments: Vec::new(),
+            options: Vec::new(),
             subcommand: None,
         };
         let mut positional = 0;
 
-        for arg in args {
-            let arg = arg.as_ref();
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
+        let mut index = 0;
 
-            if let Some(name) = arg.strip_prefix("--") {
+        while index < args.len() {
+            let arg = args[index].as_str();
+
+            if let Some(rest) = arg.strip_prefix("--") {
+                if let Some((name, value)) = rest.split_once('=') {
+                    if self.options.iter().any(|option| option.name() == name) {
+                        matches.options.push((name.to_owned(), value.to_owned()));
+                        index += 1;
+                        continue;
+                    }
+
+                    return Err(ParseError {
+                        message: format!("unknown flag: --{name}"),
+                    });
+                }
+
+                let name = rest;
+
                 if self.flags.iter().any(|flag| flag.name() == name) {
                     matches.flags.push(name.to_owned());
+                    index += 1;
+                    continue;
+                }
+
+                if self.options.iter().any(|option| option.name() == name) {
+                    let value = args.get(index + 1).ok_or_else(|| ParseError {
+                        message: format!("missing value for option: --{name}"),
+                    })?;
+                    matches.options.push((name.to_owned(), value.to_owned()));
+                    index += 2;
                     continue;
                 }
 
@@ -252,6 +323,7 @@ impl Command {
                         .find(|flag| flag.short_name() == Some(short))
                     {
                         matches.flags.push(flag.name().to_owned());
+                        index += 1;
                         continue;
                     }
                 }
@@ -263,6 +335,7 @@ impl Command {
 
             if self.subcommands.iter().any(|command| command.name() == arg) {
                 matches.subcommand = Some(arg.to_owned());
+                index += 1;
                 continue;
             }
 
@@ -271,6 +344,7 @@ impl Command {
                     .arguments
                     .push((argument.name().to_owned(), arg.to_owned()));
                 positional += 1;
+                index += 1;
                 continue;
             }
 
@@ -572,5 +646,128 @@ mod tests {
         let matches = command.parse_from(["build"]).unwrap();
 
         assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn adds_string_option() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        assert_eq!(command.options().len(), 1);
+        assert_eq!(command.options()[0].name(), "name");
+    }
+
+    #[test]
+    fn parses_string_option_separate_token() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        let matches = command.parse_from(["--name", "alice"]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("alice"));
+    }
+
+    #[test]
+    fn parses_string_option_equals_syntax() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        let matches = command.parse_from(["--name=alice"]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("alice"));
+    }
+
+    #[test]
+    fn preserves_exact_string_option_value() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        let matches = command.parse_from(["--name", "Alice-Smith"]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("Alice-Smith"));
+    }
+
+    #[test]
+    fn rejects_missing_string_option_value() {
+        let command = Command::new("ritty").option(StringOption::new("name"));
+
+        let error = command.parse_from(["--name"]).unwrap_err();
+
+        assert_eq!(error.message(), "missing value for option: --name");
+    }
+
+    #[test]
+    fn string_option_consumes_hyphen_prefixed_value() {
+        let command = Command::new("ritty").option(StringOption::new("pattern"));
+
+        let matches = command.parse_from(["--pattern", "-foo"]).unwrap();
+
+        assert_eq!(matches.option("pattern"), Some("-foo"));
+    }
+
+    #[test]
+    fn string_option_consumes_double_hyphen_prefixed_value() {
+        let command = Command::new("ritty").option(StringOption::new("pattern"));
+
+        let matches = command.parse_from(["--pattern", "--literal"]).unwrap();
+
+        assert_eq!(matches.option("pattern"), Some("--literal"));
+    }
+
+    #[test]
+    fn string_option_value_is_not_mistaken_for_subcommand() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("target"))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--target", "build"]).unwrap();
+
+        assert_eq!(matches.option("target"), Some("build"));
+        assert_eq!(matches.subcommand(), None);
+    }
+
+    #[test]
+    fn subcommand_resolves_after_string_option_value() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("target"))
+            .command(Command::new("build"));
+
+        let matches = command
+            .parse_from(["--target", "release", "build"])
+            .unwrap();
+
+        assert_eq!(matches.option("target"), Some("release"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn string_option_and_boolean_flag_coexist() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose"))
+            .option(StringOption::new("name"));
+
+        let matches = command
+            .parse_from(["--verbose", "--name", "alice"])
+            .unwrap();
+
+        assert!(matches.flag("verbose"));
+        assert_eq!(matches.option("name"), Some("alice"));
+    }
+
+    #[test]
+    fn string_option_value_does_not_advance_positional_cursor() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("name"))
+            .arg(Arg::new("target"));
+
+        let matches = command.parse_from(["--name", "alice", "world"]).unwrap();
+
+        assert_eq!(matches.option("name"), Some("alice"));
+        assert_eq!(matches.argument("target"), Some("world"));
+    }
+
+    #[test]
+    fn rejects_unknown_long_option() {
+        let command = Command::new("ritty");
+
+        let error = command.parse_from(["--wat"]).unwrap_err();
+
+        assert_eq!(error.message(), "unknown flag: --wat");
     }
 }
