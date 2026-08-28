@@ -1,5 +1,8 @@
 //! Ritty — an elegant CLI builder for Rust.
 
+use std::collections::HashSet;
+use std::iter::once;
+
 /// A positional argument in a Ritty command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg {
@@ -547,6 +550,304 @@ fn validate_enum_value(option: &EnumOption, value: &str) -> Result<(), ParseErro
     })
 }
 
+/// A two-column usage row: left-hand label and right-hand detail. An empty
+/// detail means the row has no second column.
+type UsageRow = (String, String);
+
+/// Renders rows as a deterministic, left-aligned two-column block, indented
+/// two spaces, with no trailing whitespace on rows that lack a detail.
+fn render_rows(rows: &[UsageRow]) -> String {
+    let width = rows
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|(label, detail)| {
+            if detail.is_empty() {
+                format!("  {label}")
+            } else {
+                format!("  {label:width$}  {detail}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn dedup_strings(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(item.clone()))
+        .collect()
+}
+
+fn dedup_chars(items: Vec<char>) -> Vec<char> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(*item))
+        .collect()
+}
+
+/// Single-character aliases, which the parser also accepts as short options.
+fn short_aliases(aliases: &[String]) -> Vec<char> {
+    aliases
+        .iter()
+        .filter(|a| a.chars().count() == 1)
+        .filter_map(|a| a.chars().next())
+        .collect()
+}
+
+/// Multi-character aliases, which the parser treats as long-option spellings.
+fn long_aliases(aliases: &[String]) -> Vec<&str> {
+    aliases
+        .iter()
+        .filter(|a| a.chars().count() > 1)
+        .map(String::as_str)
+        .collect()
+}
+
+/// Long spellings in display order: aliases first (insertion order), then
+/// the canonical name, deduplicated.
+fn long_spellings(canonical: &str, aliases: &[String]) -> Vec<String> {
+    let names = long_aliases(aliases)
+        .into_iter()
+        .map(String::from)
+        .chain(once(canonical.to_string()))
+        .collect();
+    dedup_strings(names)
+}
+
+/// Joins short and long spellings into one display string, e.g.
+/// `-o, --output=<dir>`. Only the canonical long spelling carries the value
+/// marker; aliases are shown bare.
+fn format_spellings(
+    shorts: &[char],
+    longs: &[String],
+    value_marker: Option<&str>,
+    canonical: &str,
+) -> String {
+    let mut parts: Vec<String> = shorts.iter().map(|c| format!("-{c}")).collect();
+    parts.extend(longs.iter().map(|name| match value_marker {
+        Some(marker) if name.as_str() == canonical => format!("--{name}={marker}"),
+        _ => format!("--{name}"),
+    }));
+    parts.join(", ")
+}
+
+/// `(Required)` when required and unsatisfied by a default; `(Default: x)`
+/// when a default exists. A default always satisfies the requirement, so the
+/// two markers are mutually exclusive.
+fn required_or_default_annotation(required: bool, default: Option<&str>) -> Option<String> {
+    match default {
+        Some(default) => Some(format!("(Default: {default})")),
+        None if required => Some("(Required)".to_string()),
+        None => None,
+    }
+}
+
+fn combine_description(description: Option<&str>, annotation: Option<String>) -> String {
+    match (description, annotation) {
+        (Some(d), Some(a)) => format!("{d} {a}"),
+        (Some(d), None) => d.to_string(),
+        (None, Some(a)) => a,
+        (None, None) => String::new(),
+    }
+}
+
+fn render_argument_row(arg: &Arg) -> UsageRow {
+    let mut label = arg.name().to_uppercase();
+    if let Some(hint) = arg.get_value_hint() {
+        label.push_str(&format!(" <{hint}>"));
+    }
+    let annotation = required_or_default_annotation(arg.is_required(), arg.default_value());
+    (
+        label,
+        combine_description(arg.get_description(), annotation),
+    )
+}
+
+fn render_string_option_row(option: &StringOption) -> UsageRow {
+    let shorts = dedup_chars(short_aliases(option.aliases()));
+    let longs = long_spellings(option.name(), option.aliases());
+    let marker = format!("<{}>", option.get_value_hint().unwrap_or(option.name()));
+    let label = format_spellings(&shorts, &longs, Some(&marker), option.name());
+    let annotation = required_or_default_annotation(option.is_required(), option.default_value());
+    (
+        label,
+        combine_description(option.get_description(), annotation),
+    )
+}
+
+fn render_enum_option_row(option: &EnumOption) -> UsageRow {
+    let shorts = dedup_chars(short_aliases(option.aliases()));
+    let longs = long_spellings(option.name(), option.aliases());
+    let marker = format!("<{}>", option.values().join("|"));
+    let label = format_spellings(&shorts, &longs, Some(&marker), option.name());
+    let annotation = required_or_default_annotation(option.is_required(), option.default_value());
+    (
+        label,
+        combine_description(option.get_description(), annotation),
+    )
+}
+
+/// Whether a `--no-*` row should be rendered for this flag: it must be
+/// parseable (the canonical name doesn't already read as a negation) and
+/// either default to `true` or carry an explicit negative description.
+fn negative_row_eligible(flag: &Flag) -> bool {
+    (flag.default_value() == Some(true) || flag.get_negative_description().is_some())
+        && !flag.name().starts_with("no-")
+}
+
+/// `--no-*` spellings the parser actually accepts: `--no-` plus every alias
+/// (the parser's long-option matching does not distinguish alias length for
+/// negation, so even a one-character alias yields a valid `--no-x`) and the
+/// canonical name. A dedicated `.short()` is not an alias and so does not by
+/// itself produce a `--no-*` spelling.
+fn negative_spellings(flag: &Flag) -> Vec<String> {
+    let names = flag
+        .aliases()
+        .iter()
+        .cloned()
+        .chain(once(flag.name().to_string()))
+        .collect();
+    dedup_strings(names)
+        .into_iter()
+        .map(|n| format!("--no-{n}"))
+        .collect()
+}
+
+fn render_flag_rows(flag: &Flag) -> Vec<UsageRow> {
+    let shorts = dedup_chars(
+        flag.short_name()
+            .into_iter()
+            .chain(short_aliases(flag.aliases()))
+            .collect(),
+    );
+    let longs = long_spellings(flag.name(), flag.aliases());
+    let label = format_spellings(&shorts, &longs, None, flag.name());
+    let default_str = flag.default_value().map(|b| b.to_string());
+    let annotation = required_or_default_annotation(flag.is_required(), default_str.as_deref());
+
+    let mut rows = vec![(
+        label,
+        combine_description(flag.get_description(), annotation),
+    )];
+
+    if negative_row_eligible(flag) {
+        let neg_label = negative_spellings(flag).join(", ");
+        let neg_detail = flag.get_negative_description().unwrap_or("").to_string();
+        rows.push((neg_label, neg_detail));
+    }
+
+    rows
+}
+
+fn render_command_rows(command: &Command) -> Vec<UsageRow> {
+    command
+        .visible_subcommands()
+        .map(|c| {
+            let mut label = c.name().to_string();
+            for alias in c.aliases() {
+                label.push_str(", ");
+                label.push_str(alias);
+            }
+            (label, c.get_description().unwrap_or("").to_string())
+        })
+        .collect()
+}
+
+/// `{description} ({name} v{version})`, degrading cleanly when either piece
+/// is absent; `None` when neither is present.
+fn render_header(description: Option<&str>, name: &str, version: Option<&str>) -> Option<String> {
+    match (description, version) {
+        (Some(d), Some(v)) => Some(format!("{d} ({name} v{v})")),
+        (Some(d), None) => Some(d.to_string()),
+        (None, Some(v)) => Some(format!("{name} v{v}")),
+        (None, None) => None,
+    }
+}
+
+fn synopsis_required_options(command: &Command) -> Vec<String> {
+    let mut items = Vec::new();
+
+    for flag in command.flags() {
+        if flag.is_required() && flag.default_value().is_none() {
+            items.push(format!("--{}", flag.name()));
+        }
+    }
+
+    for option in command.options() {
+        if option.is_required() && option.default_value().is_none() {
+            let marker = option.get_value_hint().unwrap_or(option.name());
+            items.push(format!("--{}=<{}>", option.name(), marker));
+        }
+    }
+
+    for option in command.enum_options() {
+        if option.is_required() && option.default_value().is_none() {
+            items.push(format!(
+                "--{}=<{}>",
+                option.name(),
+                option.values().join("|")
+            ));
+        }
+    }
+
+    items
+}
+
+fn synopsis_positionals(command: &Command) -> Vec<String> {
+    command
+        .arguments()
+        .iter()
+        .map(|arg| {
+            let name = arg.name().to_uppercase();
+            if arg.is_required() && arg.default_value().is_none() {
+                format!("<{name}>")
+            } else {
+                format!("[{name}]")
+            }
+        })
+        .collect()
+}
+
+/// Flattens every visible subcommand's canonical name and aliases into one
+/// pipe-joined alternative expression, e.g. `build|b|test|t`.
+fn synopsis_command_alternatives(command: &Command) -> Option<String> {
+    let tokens: Vec<String> = command
+        .visible_subcommands()
+        .flat_map(|c| once(c.name().to_string()).chain(c.aliases().iter().cloned()))
+        .collect();
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join("|"))
+    }
+}
+
+fn render_usage_line(command: &Command, display_name: &str) -> String {
+    let mut parts = vec!["USAGE".to_string(), display_name.to_string()];
+
+    let has_options = !command.flags().is_empty()
+        || !command.options().is_empty()
+        || !command.enum_options().is_empty();
+    if has_options {
+        parts.push("[OPTIONS]".to_string());
+    }
+
+    parts.extend(synopsis_required_options(command));
+    parts.extend(synopsis_positionals(command));
+
+    if let Some(alternatives) = synopsis_command_alternatives(command) {
+        parts.push(alternatives);
+    }
+
+    parts.join(" ")
+}
+
 /// A command in a Ritty CLI application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -560,6 +861,7 @@ pub struct Command {
     options: Vec<StringOption>,
     enum_options: Vec<EnumOption>,
     default_subcommand: Option<String>,
+    hidden: bool,
 }
 
 impl Command {
@@ -576,7 +878,21 @@ impl Command {
             options: Vec::new(),
             enum_options: Vec::new(),
             default_subcommand: None,
+            hidden: false,
         }
+    }
+
+    /// Marks the command as hidden from generated usage/help listings.
+    /// Hidden is presentation-only: it has no effect on parsing — a hidden
+    /// subcommand remains selectable by name, alias, or as a default subcommand.
+    pub fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+
+    /// Returns whether the command is hidden from usage/help listings.
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
     }
 
     /// Adds a subcommand alias. Aliases are exact and case-sensitive.
@@ -624,6 +940,11 @@ impl Command {
     /// Returns the configured default-subcommand spelling, if any.
     pub fn get_default_subcommand(&self) -> Option<&str> {
         self.default_subcommand.as_deref()
+    }
+
+    /// Returns subcommands eligible for usage/help listings, in declaration order.
+    fn visible_subcommands(&self) -> impl Iterator<Item = &Command> {
+        self.subcommands.iter().filter(|c| !c.is_hidden())
     }
 
     /// Returns every subcommand whose canonical name or an alias matches `name`.
@@ -1280,6 +1601,64 @@ impl Command {
     /// Returns the command version.
     pub fn get_version(&self) -> Option<&str> {
         self.version.as_deref()
+    }
+
+    /// Renders usage for this command under `display_name`, falling back to
+    /// `inherited_version` when this command declares none of its own. The
+    /// `display_name`/`inherited_version` split exists so a future nested
+    /// help traversal can render e.g. `root remote add` without redesigning
+    /// the renderer.
+    fn render_usage_named(&self, display_name: &str, inherited_version: Option<&str>) -> String {
+        let effective_version = self.version.as_deref().or(inherited_version);
+        let mut sections = Vec::new();
+
+        if let Some(header) =
+            render_header(self.description.as_deref(), display_name, effective_version)
+        {
+            sections.push(header);
+        }
+
+        sections.push(render_usage_line(self, display_name));
+
+        if !self.arguments.is_empty() {
+            let rows: Vec<UsageRow> = self.arguments.iter().map(render_argument_row).collect();
+            sections.push(format!("ARGUMENTS\n\n{}", render_rows(&rows)));
+        }
+
+        let mut option_rows: Vec<UsageRow> = Vec::new();
+        for flag in &self.flags {
+            option_rows.extend(render_flag_rows(flag));
+        }
+        for option in &self.options {
+            option_rows.push(render_string_option_row(option));
+        }
+        for option in &self.enum_options {
+            option_rows.push(render_enum_option_row(option));
+        }
+        if !option_rows.is_empty() {
+            sections.push(format!("OPTIONS\n\n{}", render_rows(&option_rows)));
+        }
+
+        let command_rows = render_command_rows(self);
+        if !command_rows.is_empty() {
+            sections.push(format!("COMMANDS\n\n{}", render_rows(&command_rows)));
+        }
+
+        sections.join("\n\n")
+    }
+
+    /// Renders deterministic, plain-text usage for this command. Hidden
+    /// subcommands are omitted from the listing and the synopsis, but remain
+    /// fully parseable — hidden is presentation-only.
+    pub fn render_usage(&self) -> String {
+        self.render_usage_named(self.name(), None)
+    }
+
+    /// Writes the rendered usage to stdout, propagating any I/O error rather
+    /// than panicking.
+    pub fn show_usage(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        writeln!(std::io::stdout(), "{}", self.render_usage())
     }
 }
 
@@ -3841,5 +4220,525 @@ mod tests {
             matches.subcommand_matches().unwrap().argument("target"),
             Some("build")
         );
+    }
+
+    // -- Hidden subcommands --
+
+    #[test]
+    fn new_command_is_visible_by_default() {
+        let command = Command::new("build");
+
+        assert!(!command.is_hidden());
+    }
+
+    #[test]
+    fn hidden_marks_command_hidden() {
+        let command = Command::new("internal").hidden();
+
+        assert!(command.is_hidden());
+    }
+
+    #[test]
+    fn hidden_command_remains_explicitly_parseable() {
+        let root = Command::new("root")
+            .command(Command::new("public"))
+            .command(Command::new("internal").hidden());
+
+        let matches = root.parse_from(["internal"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("internal"));
+    }
+
+    #[test]
+    fn hidden_command_alias_remains_parseable() {
+        let root = Command::new("root").command(Command::new("internal").alias("i").hidden());
+
+        let matches = root.parse_from(["i"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("internal"));
+    }
+
+    #[test]
+    fn hidden_default_subcommand_still_resolves() {
+        let root = Command::new("root")
+            .default_subcommand("internal")
+            .command(Command::new("internal").hidden());
+
+        let matches = root.parse_from(Vec::<&str>::new()).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("internal"));
+    }
+
+    // -- Usage: header --
+
+    #[test]
+    fn usage_basic_command_name() {
+        let command = Command::new("ritty");
+
+        assert_eq!(command.render_usage(), "USAGE ritty");
+    }
+
+    #[test]
+    fn usage_description() {
+        let command = Command::new("ritty").description("Elegant CLI builder");
+
+        assert_eq!(command.render_usage(), "Elegant CLI builder\n\nUSAGE ritty");
+    }
+
+    #[test]
+    fn usage_version() {
+        let command = Command::new("ritty").version("1.0.0");
+
+        assert_eq!(command.render_usage(), "ritty v1.0.0\n\nUSAGE ritty");
+    }
+
+    #[test]
+    fn usage_description_and_version() {
+        let command = Command::new("ritty")
+            .description("Elegant CLI builder")
+            .version("1.0.0");
+
+        assert_eq!(
+            command.render_usage(),
+            "Elegant CLI builder (ritty v1.0.0)\n\nUSAGE ritty"
+        );
+    }
+
+    // -- Usage: positionals --
+
+    #[test]
+    fn usage_required_positional() {
+        let command = Command::new("ritty").arg(Arg::new("target").required());
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty <TARGET>\n\nARGUMENTS\n\n  TARGET  (Required)"
+        );
+    }
+
+    #[test]
+    fn usage_optional_positional() {
+        let command = Command::new("ritty").arg(Arg::new("target"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [TARGET]\n\nARGUMENTS\n\n  TARGET"
+        );
+    }
+
+    #[test]
+    fn usage_positional_default() {
+        let command = Command::new("ritty").arg(Arg::new("target").required().default("main"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [TARGET]\n\nARGUMENTS\n\n  TARGET  (Default: main)"
+        );
+    }
+
+    #[test]
+    fn usage_positional_description() {
+        let command = Command::new("ritty").arg(Arg::new("target").description("Build target"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [TARGET]\n\nARGUMENTS\n\n  TARGET  Build target"
+        );
+    }
+
+    #[test]
+    fn usage_positional_value_hint() {
+        let command = Command::new("ritty").arg(Arg::new("target").value_hint("dir"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [TARGET]\n\nARGUMENTS\n\n  TARGET <dir>"
+        );
+    }
+
+    // -- Usage: string options --
+
+    #[test]
+    fn usage_string_option() {
+        let command = Command::new("ritty").option(StringOption::new("output"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --output=<output>"
+        );
+    }
+
+    #[test]
+    fn usage_short_string_alias() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -o, --output=<output>"
+        );
+    }
+
+    #[test]
+    fn usage_long_string_alias() {
+        let command =
+            Command::new("ritty").option(StringOption::new("output").alias("destination"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --destination, --output=<output>"
+        );
+    }
+
+    #[test]
+    fn usage_string_value_hint() {
+        let command = Command::new("ritty").option(StringOption::new("output").value_hint("dir"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --output=<dir>"
+        );
+    }
+
+    #[test]
+    fn usage_string_default() {
+        let command = Command::new("ritty").option(StringOption::new("output").default("dist"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --output=<output>  (Default: dist)"
+        );
+    }
+
+    #[test]
+    fn usage_required_string_option() {
+        let command = Command::new("ritty").option(StringOption::new("output").required());
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS] --output=<output>\n\nOPTIONS\n\n  --output=<output>  (Required)"
+        );
+    }
+
+    // -- Usage: enum options --
+
+    #[test]
+    fn usage_enum_choices() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("level", ["debug", "info", "warn"]));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --level=<debug|info|warn>"
+        );
+    }
+
+    #[test]
+    fn usage_enum_aliases() {
+        let command = Command::new("ritty").enum_option(
+            EnumOption::new("level", ["debug", "info"])
+                .alias("l")
+                .alias("log-level"),
+        );
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -l, --log-level, --level=<debug|info>"
+        );
+    }
+
+    #[test]
+    fn usage_enum_default() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).default("info"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --level=<debug|info>  (Default: info)"
+        );
+    }
+
+    // -- Usage: boolean flags --
+
+    #[test]
+    fn usage_boolean_canonical_flag() {
+        let command = Command::new("ritty").flag(Flag::new("verbose"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --verbose"
+        );
+    }
+
+    #[test]
+    fn usage_dedicated_short_flag() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v'));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -v, --verbose"
+        );
+    }
+
+    #[test]
+    fn usage_boolean_aliases() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v').alias("chatty"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -v, --chatty, --verbose"
+        );
+    }
+
+    #[test]
+    fn usage_boolean_default() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").default(false));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --verbose  (Default: false)"
+        );
+    }
+
+    #[test]
+    fn usage_boolean_required_marker() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").required());
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS] --verbose\n\nOPTIONS\n\n  --verbose  (Required)"
+        );
+    }
+
+    // -- Usage: negative booleans --
+
+    #[test]
+    fn usage_negative_boolean_from_default_true() {
+        let command = Command::new("ritty").flag(Flag::new("color").default(true));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --color     (Default: true)\n  --no-color"
+        );
+    }
+
+    #[test]
+    fn usage_negative_boolean_from_negative_description() {
+        let command =
+            Command::new("ritty").flag(Flag::new("color").negative_description("Disable color"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --color\n  --no-color  Disable color"
+        );
+    }
+
+    #[test]
+    fn usage_negative_boolean_from_default_true_and_negative_description() {
+        let command = Command::new("ritty").flag(
+            Flag::new("color")
+                .default(true)
+                .description("Enable color")
+                .negative_description("Disable color"),
+        );
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --color     Enable color (Default: true)\n  --no-color  Disable color"
+        );
+    }
+
+    #[test]
+    fn usage_no_double_negative_when_canonical_already_negative() {
+        let command = Command::new("ritty").flag(Flag::new("no-cache").default(true));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  --no-cache  (Default: true)"
+        );
+    }
+
+    #[test]
+    fn usage_negative_boolean_does_not_advertise_unparseable_short_negation() {
+        // `.short('v')` alone does not register "v" as a long alias, so
+        // `--no-v` is not something the parser accepts; only `--no-verbose`
+        // should be advertised.
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v').default(true));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -v, --verbose  (Default: true)\n  --no-verbose"
+        );
+    }
+
+    // -- Usage: alias deduplication --
+
+    #[test]
+    fn usage_aliases_deduplicate_visually() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v').alias("v"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -v, --verbose"
+        );
+    }
+
+    // -- Usage: declaration order --
+
+    #[test]
+    fn usage_multiple_arguments_and_options_retain_declaration_order() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("first"))
+            .arg(Arg::new("second"))
+            .flag(Flag::new("alpha"))
+            .option(StringOption::new("beta"))
+            .enum_option(EnumOption::new("gamma", ["x", "y"]));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS] [FIRST] [SECOND]\n\n\
+             ARGUMENTS\n\n  FIRST\n  SECOND\n\n\
+             OPTIONS\n\n  --alpha\n  --beta=<beta>\n  --gamma=<x|y>"
+        );
+    }
+
+    // -- Usage: subcommands --
+
+    #[test]
+    fn usage_visible_subcommands() {
+        let command = Command::new("ritty")
+            .command(Command::new("build").description("Build the project"))
+            .command(Command::new("test").description("Run tests"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty build|test\n\n\
+             COMMANDS\n\n  build  Build the project\n  test   Run tests"
+        );
+    }
+
+    #[test]
+    fn usage_subcommand_aliases() {
+        let command = Command::new("ritty").command(Command::new("build").alias("b"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty build|b\n\nCOMMANDS\n\n  build, b"
+        );
+    }
+
+    #[test]
+    fn usage_subcommand_descriptions() {
+        let command =
+            Command::new("ritty").command(Command::new("build").description("Build the project"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty build\n\nCOMMANDS\n\n  build  Build the project"
+        );
+    }
+
+    #[test]
+    fn usage_hidden_subcommands_omitted() {
+        let command = Command::new("ritty")
+            .command(Command::new("build"))
+            .command(Command::new("internal").hidden());
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty build\n\nCOMMANDS\n\n  build"
+        );
+    }
+
+    #[test]
+    fn usage_hidden_subcommand_aliases_omitted() {
+        let command = Command::new("ritty")
+            .command(Command::new("build"))
+            .command(Command::new("internal").alias("i").hidden());
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty build\n\nCOMMANDS\n\n  build"
+        );
+    }
+
+    #[test]
+    fn usage_visible_command_alternatives_in_synopsis() {
+        let command = Command::new("ritty")
+            .command(Command::new("build").alias("b"))
+            .command(Command::new("test").alias("t"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty build|b|test|t\n\nCOMMANDS\n\n  build, b\n  test, t"
+        );
+    }
+
+    #[test]
+    fn usage_all_hidden_subcommands_leave_no_commands_section() {
+        let command = Command::new("ritty").command(Command::new("internal").hidden());
+
+        assert_eq!(command.render_usage(), "USAGE ritty");
+    }
+
+    // -- Usage: empty / clean rendering --
+
+    #[test]
+    fn usage_command_with_no_metadata_renders_cleanly() {
+        let command = Command::new("ritty");
+
+        assert_eq!(command.render_usage(), "USAGE ritty");
+    }
+
+    #[test]
+    fn usage_missing_descriptions_do_not_produce_artifacts() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("target"))
+            .flag(Flag::new("verbose"))
+            .command(Command::new("build"));
+
+        let rendered = command.render_usage();
+
+        assert!(!rendered.contains("None"));
+        assert!(!rendered.contains("Some("));
+        assert!(!rendered.contains("undefined"));
+    }
+
+    #[test]
+    fn usage_has_no_trailing_whitespace_on_any_line() {
+        let command = Command::new("ritty")
+            .description("Elegant CLI builder")
+            .version("1.0.0")
+            .arg(Arg::new("target"))
+            .flag(Flag::new("verbose").short('v'))
+            .option(StringOption::new("output").default("dist"))
+            .enum_option(EnumOption::new("level", ["debug", "info"]).required())
+            .command(
+                Command::new("build")
+                    .alias("b")
+                    .description("Build the project"),
+            )
+            .command(Command::new("internal").hidden());
+
+        let rendered = command.render_usage();
+
+        for line in rendered.lines() {
+            assert_eq!(line, line.trim_end());
+        }
+    }
+
+    #[test]
+    fn usage_rendering_is_deterministic_across_repeated_calls() {
+        let command = Command::new("ritty")
+            .description("Elegant CLI builder")
+            .version("1.0.0")
+            .arg(Arg::new("target").required())
+            .flag(Flag::new("verbose").short('v'))
+            .option(StringOption::new("output").alias("o").default("dist"))
+            .command(Command::new("build").alias("b"));
+
+        let first = command.render_usage();
+        let second = command.render_usage();
+
+        assert_eq!(first, second);
     }
 }
