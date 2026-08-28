@@ -163,6 +163,12 @@ impl StringOption {
 pub struct Flag {
     name: String,
     short: Option<char>,
+    aliases: Vec<String>,
+    description: Option<String>,
+    negative_description: Option<String>,
+    value_hint: Option<String>,
+    required: bool,
+    default: Option<bool>,
 }
 
 impl Flag {
@@ -171,6 +177,12 @@ impl Flag {
         Self {
             name: name.into(),
             short: None,
+            aliases: Vec::new(),
+            description: None,
+            negative_description: None,
+            value_hint: None,
+            required: false,
+            default: None,
         }
     }
 
@@ -178,6 +190,73 @@ impl Flag {
     pub fn short(mut self, short: char) -> Self {
         self.short = Some(short);
         self
+    }
+
+    /// Adds an alias. A single-character alias can also be used as a short
+    /// flag (`-q`); a multi-character alias is a long-flag alias (`--chatty`).
+    pub fn alias(mut self, alias: impl Into<String>) -> Self {
+        self.aliases.push(alias.into());
+        self
+    }
+
+    /// Returns the flag's aliases, in insertion order.
+    pub fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    /// Sets the flag description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Returns the flag description.
+    pub fn get_description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Sets the description shown for the `--no-*` negation.
+    pub fn negative_description(mut self, description: impl Into<String>) -> Self {
+        self.negative_description = Some(description.into());
+        self
+    }
+
+    /// Returns the negative-description metadata.
+    pub fn get_negative_description(&self) -> Option<&str> {
+        self.negative_description.as_deref()
+    }
+
+    /// Sets the flag's value hint, for usage rendering.
+    pub fn value_hint(mut self, value_hint: impl Into<String>) -> Self {
+        self.value_hint = Some(value_hint.into());
+        self
+    }
+
+    /// Returns the flag's value hint.
+    pub fn get_value_hint(&self) -> Option<&str> {
+        self.value_hint.as_deref()
+    }
+
+    /// Marks the flag as required.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Returns whether the flag is required.
+    pub fn is_required(&self) -> bool {
+        self.required
+    }
+
+    /// Sets the default value used when the flag is not supplied.
+    pub fn default(mut self, default: bool) -> Self {
+        self.default = Some(default);
+        self
+    }
+
+    /// Returns the flag's default value, if any.
+    pub fn default_value(&self) -> Option<bool> {
+        self.default
     }
 
     /// Returns the flag name.
@@ -194,16 +273,30 @@ impl Flag {
 /// Parsed command-line matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matches {
-    flags: Vec<String>,
+    flags: Vec<(String, bool)>,
     arguments: Vec<(String, String)>,
     options: Vec<(String, String)>,
     subcommand: Option<String>,
 }
 
 impl Matches {
-    /// Returns whether a flag was present.
+    /// Returns the flag's effective boolean value (`false` if absent).
     pub fn flag(&self, name: &str) -> bool {
-        self.flags.iter().any(|flag| flag == name)
+        self.flags
+            .iter()
+            .find(|(flag, _)| flag == name)
+            .map(|(_, value)| *value)
+            .unwrap_or(false)
+    }
+
+    /// Records the effective boolean state for a canonical flag name,
+    /// overwriting any prior state so only one value survives per flag.
+    fn set_flag(&mut self, name: &str, value: bool) {
+        if let Some(entry) = self.flags.iter_mut().find(|(flag, _)| flag == name) {
+            entry.1 = value;
+        } else {
+            self.flags.push((name.to_owned(), value));
+        }
     }
 
     /// Returns the value of a positional argument.
@@ -239,6 +332,13 @@ impl ParseError {
     pub fn message(&self) -> &str {
         &self.message
     }
+}
+
+/// Resolution of a bare long-option token to either a flag (with its
+/// effective positive/negative value) or a string option.
+enum LongMatch<'a> {
+    Flag(&'a Flag, bool),
+    Option(&'a StringOption),
 }
 
 /// A command in a Ritty CLI application.
@@ -344,6 +444,61 @@ impl Command {
             .collect()
     }
 
+    /// Returns every flag whose canonical name or an alias matches `name`.
+    fn flags_matching_long(&self, name: &str) -> Vec<&Flag> {
+        self.flags
+            .iter()
+            .filter(|flag| flag.name() == name || flag.aliases().iter().any(|a| a == name))
+            .collect()
+    }
+
+    /// Returns every flag that declares `short` as its dedicated short name
+    /// or as a single-character alias.
+    fn flags_matching_short(&self, short: char) -> Vec<&Flag> {
+        self.flags
+            .iter()
+            .filter(|flag| {
+                flag.short_name() == Some(short)
+                    || flag
+                        .aliases()
+                        .iter()
+                        .any(|alias| alias.len() == 1 && alias.starts_with(short))
+            })
+            .collect()
+    }
+
+    /// Resolves a bare long-option token (no `--` prefix, no `=`) against
+    /// declared flags (positive and `no-*` negation) and string options,
+    /// erroring on ambiguity rather than silently preferring one schema.
+    fn resolve_long(&self, name: &str) -> Result<Option<LongMatch<'_>>, ParseError> {
+        let positive_flags = self.flags_matching_long(name);
+        let string_options = self.options_matching_long(name);
+        let negative_flags = name
+            .strip_prefix("no-")
+            .map(|base| self.flags_matching_long(base))
+            .unwrap_or_default();
+
+        if positive_flags.len() + string_options.len() + negative_flags.len() > 1 {
+            return Err(ParseError {
+                message: format!("ambiguous option: --{name}"),
+            });
+        }
+
+        if let Some(flag) = positive_flags.first() {
+            return Ok(Some(LongMatch::Flag(flag, true)));
+        }
+
+        if let Some(option) = string_options.first() {
+            return Ok(Some(LongMatch::Option(option)));
+        }
+
+        if let Some(flag) = negative_flags.first() {
+            return Ok(Some(LongMatch::Flag(flag, false)));
+        }
+
+        Ok(None)
+    }
+
     /// Parses command-line arguments.
     pub fn parse_from<I, S>(&self, args: I) -> Result<Matches, ParseError>
     where
@@ -391,33 +546,28 @@ impl Command {
 
                 let name = rest;
 
-                if self.flags.iter().any(|flag| flag.name() == name) {
-                    matches.flags.push(name.to_owned());
-                    index += 1;
-                    continue;
+                match self.resolve_long(name)? {
+                    Some(LongMatch::Flag(flag, value)) => {
+                        matches.set_flag(flag.name(), value);
+                        index += 1;
+                        continue;
+                    }
+                    Some(LongMatch::Option(option)) => {
+                        let value = args.get(index + 1).ok_or_else(|| ParseError {
+                            message: format!("missing value for option: --{name}"),
+                        })?;
+                        matches
+                            .options
+                            .push((option.name().to_owned(), value.to_owned()));
+                        index += 2;
+                        continue;
+                    }
+                    None => {
+                        return Err(ParseError {
+                            message: format!("unknown flag: --{name}"),
+                        });
+                    }
                 }
-
-                let candidates = self.options_matching_long(name);
-                if candidates.len() > 1 {
-                    return Err(ParseError {
-                        message: format!("ambiguous option: --{name}"),
-                    });
-                }
-
-                if let Some(option) = candidates.first() {
-                    let value = args.get(index + 1).ok_or_else(|| ParseError {
-                        message: format!("missing value for option: --{name}"),
-                    })?;
-                    matches
-                        .options
-                        .push((option.name().to_owned(), value.to_owned()));
-                    index += 2;
-                    continue;
-                }
-
-                return Err(ParseError {
-                    message: format!("unknown flag: --{name}"),
-                });
             }
 
             if let Some(rest) = arg.strip_prefix('-') {
@@ -448,20 +598,17 @@ impl Command {
 
                 if rest.len() == 1 {
                     let short = rest.chars().next().unwrap();
-                    let flag_match = self
-                        .flags
-                        .iter()
-                        .find(|flag| flag.short_name() == Some(short));
+                    let flag_candidates = self.flags_matching_short(short);
                     let option_candidates = self.options_matching_short(short);
 
-                    if option_candidates.len() + usize::from(flag_match.is_some()) > 1 {
+                    if flag_candidates.len() + option_candidates.len() > 1 {
                         return Err(ParseError {
                             message: format!("ambiguous option: -{short}"),
                         });
                     }
 
-                    if let Some(flag) = flag_match {
-                        matches.flags.push(flag.name().to_owned());
+                    if let Some(flag) = flag_candidates.first() {
+                        matches.set_flag(flag.name(), true);
                         index += 1;
                         continue;
                     }
@@ -511,6 +658,22 @@ impl Command {
                 None if argument.is_required() => {
                     return Err(ParseError {
                         message: format!("missing required argument: {}", argument.name()),
+                    });
+                }
+                None => {}
+            }
+        }
+
+        for flag in &self.flags {
+            if matches.flags.iter().any(|(name, _)| name == flag.name()) {
+                continue;
+            }
+
+            match flag.default_value() {
+                Some(default) => matches.set_flag(flag.name(), default),
+                None if flag.is_required() => {
+                    return Err(ParseError {
+                        message: format!("missing required option: --{}", flag.name()),
                     });
                 }
                 None => {}
@@ -1322,5 +1485,329 @@ mod tests {
         let error = command.parse_from(["-x", "value"]).unwrap_err();
 
         assert_eq!(error.message(), "ambiguous option: -x");
+    }
+
+    #[test]
+    fn flag_metadata_defaults_to_none() {
+        let flag = Flag::new("color");
+
+        assert!(flag.aliases().is_empty());
+        assert_eq!(flag.get_description(), None);
+        assert_eq!(flag.get_negative_description(), None);
+        assert_eq!(flag.get_value_hint(), None);
+        assert!(!flag.is_required());
+        assert_eq!(flag.default_value(), None);
+    }
+
+    #[test]
+    fn configures_flag_metadata() {
+        let flag = Flag::new("color")
+            .short('c')
+            .alias("colour")
+            .alias("colors")
+            .description("Enable color output")
+            .negative_description("Disable color output")
+            .value_hint("bool")
+            .required()
+            .default(true);
+
+        assert_eq!(flag.name(), "color");
+        assert_eq!(flag.short_name(), Some('c'));
+        assert_eq!(flag.aliases(), ["colour", "colors"]);
+        assert_eq!(flag.get_description(), Some("Enable color output"));
+        assert_eq!(
+            flag.get_negative_description(),
+            Some("Disable color output")
+        );
+        assert_eq!(flag.get_value_hint(), Some("bool"));
+        assert!(flag.is_required());
+        assert_eq!(flag.default_value(), Some(true));
+    }
+
+    #[test]
+    fn dedicated_short_still_works_alongside_aliases() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v').alias("chatty"));
+
+        let matches = command.parse_from(["-v"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+    }
+
+    #[test]
+    fn parses_long_flag_alias() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").alias("chatty"));
+
+        let matches = command.parse_from(["--chatty"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+    }
+
+    #[test]
+    fn single_char_flag_alias_works_as_short_and_long() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").alias("q"));
+
+        let short = command.parse_from(["-q"]).unwrap();
+        let long = command.parse_from(["--q"]).unwrap();
+
+        assert!(short.flag("verbose"));
+        assert!(long.flag("verbose"));
+    }
+
+    #[test]
+    fn flag_default_true_applies_when_absent() {
+        let command = Command::new("ritty").flag(Flag::new("color").default(true));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert!(matches.flag("color"));
+    }
+
+    #[test]
+    fn flag_default_false_applies_when_absent() {
+        let command = Command::new("ritty").flag(Flag::new("color").default(false));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert!(!matches.flag("color"));
+    }
+
+    #[test]
+    fn explicit_positive_overrides_false_default() {
+        let command = Command::new("ritty").flag(Flag::new("color").default(false));
+
+        let matches = command.parse_from(["--color"]).unwrap();
+
+        assert!(matches.flag("color"));
+    }
+
+    #[test]
+    fn negation_overrides_true_default() {
+        let command = Command::new("ritty").flag(Flag::new("color").default(true));
+
+        let matches = command.parse_from(["--no-color"]).unwrap();
+
+        assert!(!matches.flag("color"));
+    }
+
+    #[test]
+    fn parses_canonical_negation() {
+        let command = Command::new("ritty").flag(Flag::new("color"));
+
+        let matches = command.parse_from(["--no-color"]).unwrap();
+
+        assert!(!matches.flag("color"));
+    }
+
+    #[test]
+    fn parses_long_alias_negation() {
+        let command = Command::new("ritty").flag(Flag::new("color").alias("colour"));
+
+        let matches = command.parse_from(["--no-colour"]).unwrap();
+
+        assert!(!matches.flag("color"));
+    }
+
+    #[test]
+    fn parses_single_char_alias_negation() {
+        let command = Command::new("ritty").flag(Flag::new("color").alias("c"));
+
+        let matches = command.parse_from(["--no-c"]).unwrap();
+
+        assert!(!matches.flag("color"));
+    }
+
+    #[test]
+    fn dedicated_short_does_not_support_negation() {
+        let command = Command::new("ritty").flag(Flag::new("color").short('c'));
+
+        let error = command.parse_from(["--no-c"]).unwrap_err();
+
+        assert_eq!(error.message(), "unknown flag: --no-c");
+    }
+
+    #[test]
+    fn rejects_missing_required_flag() {
+        let command = Command::new("ritty").flag(Flag::new("confirm").required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required option: --confirm");
+    }
+
+    #[test]
+    fn required_flag_satisfied_by_positive() {
+        let command = Command::new("ritty").flag(Flag::new("confirm").required());
+
+        let matches = command.parse_from(["--confirm"]).unwrap();
+
+        assert!(matches.flag("confirm"));
+    }
+
+    #[test]
+    fn required_flag_satisfied_by_negation() {
+        let command = Command::new("ritty").flag(Flag::new("confirm").required());
+
+        let matches = command.parse_from(["--no-confirm"]).unwrap();
+
+        assert!(!matches.flag("confirm"));
+    }
+
+    #[test]
+    fn required_flag_satisfied_by_default() {
+        let command = Command::new("ritty").flag(Flag::new("confirm").required().default(false));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert!(!matches.flag("confirm"));
+    }
+
+    #[test]
+    fn repeated_positive_then_negative_yields_negative() {
+        let command = Command::new("ritty").flag(Flag::new("verbose"));
+
+        let matches = command.parse_from(["--verbose", "--no-verbose"]).unwrap();
+
+        assert!(!matches.flag("verbose"));
+    }
+
+    #[test]
+    fn repeated_negative_then_positive_yields_positive() {
+        let command = Command::new("ritty").flag(Flag::new("verbose"));
+
+        let matches = command.parse_from(["--no-verbose", "--verbose"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+    }
+
+    #[test]
+    fn rejects_unknown_negation() {
+        let command = Command::new("ritty").flag(Flag::new("color"));
+
+        let error = command.parse_from(["--no-verbose"]).unwrap_err();
+
+        assert_eq!(error.message(), "unknown flag: --no-verbose");
+    }
+
+    #[test]
+    fn two_boolean_long_aliases_colliding_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("first").alias("x"))
+            .flag(Flag::new("second").alias("x"));
+
+        let error = command.parse_from(["--x"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: --x");
+    }
+
+    #[test]
+    fn two_boolean_short_spellings_colliding_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("first").short('x'))
+            .flag(Flag::new("second").short('x'));
+
+        let error = command.parse_from(["-x"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: -x");
+    }
+
+    #[test]
+    fn boolean_long_and_string_long_alias_collision_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose").alias("mode"))
+            .option(StringOption::new("output").alias("mode"));
+
+        let error = command.parse_from(["--mode"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: --mode");
+    }
+
+    #[test]
+    fn flag_named_no_cache_parses_as_exact_positive() {
+        let command = Command::new("ritty").flag(Flag::new("no-cache"));
+
+        let matches = command.parse_from(["--no-cache"]).unwrap();
+
+        assert!(matches.flag("no-cache"));
+    }
+
+    #[test]
+    fn no_cache_ambiguous_between_positive_and_negation() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("cache"))
+            .flag(Flag::new("no-cache"));
+
+        let error = command.parse_from(["--no-cache"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: --no-cache");
+    }
+
+    #[test]
+    fn boolean_negation_and_string_option_exact_collision_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("cache"))
+            .option(StringOption::new("no-cache"));
+
+        let error = command.parse_from(["--no-cache"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: --no-cache");
+    }
+
+    #[test]
+    fn exact_string_option_no_cache_works_without_boolean_collision() {
+        let command = Command::new("ritty").option(StringOption::new("no-cache"));
+
+        let matches = command.parse_from(["--no-cache", "value"]).unwrap();
+
+        assert_eq!(matches.option("no-cache"), Some("value"));
+    }
+
+    #[test]
+    fn boolean_positive_followed_by_subcommand() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose"))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--verbose", "build"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn boolean_negative_followed_by_subcommand() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose"))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--no-verbose", "build"]).unwrap();
+
+        assert!(!matches.flag("verbose"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn boolean_negation_does_not_advance_positional_cursor() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose"))
+            .arg(Arg::new("target"));
+
+        let matches = command.parse_from(["--no-verbose", "world"]).unwrap();
+
+        assert!(!matches.flag("verbose"));
+        assert_eq!(matches.argument("target"), Some("world"));
+    }
+
+    #[test]
+    fn flag_metadata_does_not_affect_parsing() {
+        let command = Command::new("ritty").flag(
+            Flag::new("color")
+                .description("Enable colors")
+                .negative_description("Disable colors")
+                .value_hint("bool"),
+        );
+
+        let matches = command.parse_from(["--no-color"]).unwrap();
+
+        assert!(!matches.flag("color"));
     }
 }
