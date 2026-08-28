@@ -6,6 +6,7 @@ pub struct Command {
     name: String,
     description: Option<String>,
     version: Option<String>,
+    subcommands: Vec<Command>,
 }
 
 impl Command {
@@ -15,6 +16,7 @@ impl Command {
             name: name.into(),
             description: None,
             version: None,
+            subcommands: Vec::new(),
         }
     }
 
@@ -28,6 +30,17 @@ impl Command {
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
+    }
+
+    /// Adds a subcommand.
+    pub fn command(mut self, command: Command) -> Self {
+        self.subcommands.push(command);
+        self
+    }
+
+    /// Returns the command's subcommands.
+    pub fn subcommands(&self) -> &[Command] {
+        &self.subcommands
     }
 
     /// Returns the command name.
@@ -71,5 +84,13 @@ mod tests {
             Some("Elegant CLI builder for Rust")
         );
         assert_eq!(command.get_version(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn adds_subcommand() {
+        let command = Command::new("ritty").command(Command::new("build"));
+
+        assert_eq!(command.subcommands().len(), 1);
+        assert_eq!(command.subcommands()[0].name(), "build");
     }
 }
