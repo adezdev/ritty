@@ -158,6 +158,104 @@ impl StringOption {
     }
 }
 
+/// A named enum option in a Ritty command, e.g. `--level info`, whose value
+/// must belong to a declared set of allowed values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumOption {
+    name: String,
+    aliases: Vec<String>,
+    values: Vec<String>,
+    description: Option<String>,
+    value_hint: Option<String>,
+    required: bool,
+    default: Option<String>,
+}
+
+impl EnumOption {
+    /// Creates a new enum option with the given allowed values, in
+    /// declaration order. An empty list means no value restriction.
+    pub fn new(
+        name: impl Into<String>,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            aliases: Vec::new(),
+            values: values.into_iter().map(Into::into).collect(),
+            description: None,
+            value_hint: None,
+            required: false,
+            default: None,
+        }
+    }
+
+    /// Adds an alias. A single-character alias can also be used as a short
+    /// option (`-l`); a multi-character alias is a long-option alias (`--log-level`).
+    pub fn alias(mut self, alias: impl Into<String>) -> Self {
+        self.aliases.push(alias.into());
+        self
+    }
+
+    /// Returns the option's aliases, in insertion order.
+    pub fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    /// Returns the option's allowed values, in declaration order.
+    pub fn values(&self) -> &[String] {
+        &self.values
+    }
+
+    /// Sets the option description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Sets the option's value hint, for usage rendering.
+    pub fn value_hint(mut self, value_hint: impl Into<String>) -> Self {
+        self.value_hint = Some(value_hint.into());
+        self
+    }
+
+    /// Marks the option as required.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Sets the default value used when the option is not supplied.
+    pub fn default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+
+    /// Returns the option name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns whether the option is required.
+    pub fn is_required(&self) -> bool {
+        self.required
+    }
+
+    /// Returns the option's default value, if any.
+    pub fn default_value(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+
+    /// Returns the option description.
+    pub fn get_description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Returns the option's value hint.
+    pub fn get_value_hint(&self) -> Option<&str> {
+        self.value_hint.as_deref()
+    }
+}
+
 /// A boolean flag in a Ritty command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag {
@@ -276,6 +374,7 @@ pub struct Matches {
     flags: Vec<(String, bool)>,
     arguments: Vec<(String, String)>,
     options: Vec<(String, String)>,
+    enum_options: Vec<(String, String)>,
     subcommand: Option<String>,
 }
 
@@ -315,6 +414,14 @@ impl Matches {
             .map(|(_, value)| value.as_str())
     }
 
+    /// Returns the value of an enum option.
+    pub fn enum_option(&self, name: &str) -> Option<&str> {
+        self.enum_options
+            .iter()
+            .find(|(option, _)| option == name)
+            .map(|(_, value)| value.as_str())
+    }
+
     /// Returns the selected subcommand.
     pub fn subcommand(&self) -> Option<&str> {
         self.subcommand.as_deref()
@@ -339,6 +446,24 @@ impl ParseError {
 enum LongMatch<'a> {
     Flag(&'a Flag, bool),
     Option(&'a StringOption),
+    EnumOption(&'a EnumOption),
+}
+
+/// Validates an enum option's effective value against its allowed values.
+/// An empty allowed-value list means there is no restriction.
+fn validate_enum_value(option: &EnumOption, value: &str) -> Result<(), ParseError> {
+    if option.values().is_empty() || option.values().iter().any(|allowed| allowed == value) {
+        return Ok(());
+    }
+
+    Err(ParseError {
+        message: format!(
+            "invalid value for option: --{}: {} (expected one of: {})",
+            option.name(),
+            value,
+            option.values().join(", ")
+        ),
+    })
 }
 
 /// A command in a Ritty CLI application.
@@ -351,6 +476,7 @@ pub struct Command {
     arguments: Vec<Arg>,
     flags: Vec<Flag>,
     options: Vec<StringOption>,
+    enum_options: Vec<EnumOption>,
 }
 
 impl Command {
@@ -364,6 +490,7 @@ impl Command {
             arguments: Vec::new(),
             flags: Vec::new(),
             options: Vec::new(),
+            enum_options: Vec::new(),
         }
     }
 
@@ -423,6 +550,17 @@ impl Command {
         &self.options
     }
 
+    /// Adds an enum option.
+    pub fn enum_option(mut self, option: EnumOption) -> Self {
+        self.enum_options.push(option);
+        self
+    }
+
+    /// Returns the command's enum options.
+    pub fn enum_options(&self) -> &[EnumOption] {
+        &self.enum_options
+    }
+
     /// Returns every string option whose canonical name or an alias matches `name`.
     fn options_matching_long(&self, name: &str) -> Vec<&StringOption> {
         self.options
@@ -434,6 +572,27 @@ impl Command {
     /// Returns every string option that declares `short` as a single-character alias.
     fn options_matching_short(&self, short: char) -> Vec<&StringOption> {
         self.options
+            .iter()
+            .filter(|option| {
+                option
+                    .aliases()
+                    .iter()
+                    .any(|alias| alias.len() == 1 && alias.starts_with(short))
+            })
+            .collect()
+    }
+
+    /// Returns every enum option whose canonical name or an alias matches `name`.
+    fn enum_options_matching_long(&self, name: &str) -> Vec<&EnumOption> {
+        self.enum_options
+            .iter()
+            .filter(|option| option.name() == name || option.aliases().iter().any(|a| a == name))
+            .collect()
+    }
+
+    /// Returns every enum option that declares `short` as a single-character alias.
+    fn enum_options_matching_short(&self, short: char) -> Vec<&EnumOption> {
+        self.enum_options
             .iter()
             .filter(|option| {
                 option
@@ -473,12 +632,15 @@ impl Command {
     fn resolve_long(&self, name: &str) -> Result<Option<LongMatch<'_>>, ParseError> {
         let positive_flags = self.flags_matching_long(name);
         let string_options = self.options_matching_long(name);
+        let enum_options = self.enum_options_matching_long(name);
         let negative_flags = name
             .strip_prefix("no-")
             .map(|base| self.flags_matching_long(base))
             .unwrap_or_default();
 
-        if positive_flags.len() + string_options.len() + negative_flags.len() > 1 {
+        if positive_flags.len() + string_options.len() + enum_options.len() + negative_flags.len()
+            > 1
+        {
             return Err(ParseError {
                 message: format!("ambiguous option: --{name}"),
             });
@@ -490,6 +652,10 @@ impl Command {
 
         if let Some(option) = string_options.first() {
             return Ok(Some(LongMatch::Option(option)));
+        }
+
+        if let Some(option) = enum_options.first() {
+            return Ok(Some(LongMatch::EnumOption(option)));
         }
 
         if let Some(flag) = negative_flags.first() {
@@ -509,6 +675,7 @@ impl Command {
             flags: Vec::new(),
             arguments: Vec::new(),
             options: Vec::new(),
+            enum_options: Vec::new(),
             subcommand: None,
         };
         let mut positional = 0;
@@ -524,16 +691,36 @@ impl Command {
 
             if let Some(rest) = arg.strip_prefix("--") {
                 if let Some((name, value)) = rest.split_once('=') {
-                    let candidates = self.options_matching_long(name);
-                    if candidates.len() > 1 {
+                    let positive_flags = self.flags_matching_long(name);
+                    let negative_flags = name
+                        .strip_prefix("no-")
+                        .map(|base| self.flags_matching_long(base))
+                        .unwrap_or_default();
+                    let string_candidates = self.options_matching_long(name);
+                    let enum_candidates = self.enum_options_matching_long(name);
+
+                    if positive_flags.len()
+                        + negative_flags.len()
+                        + string_candidates.len()
+                        + enum_candidates.len()
+                        > 1
+                    {
                         return Err(ParseError {
                             message: format!("ambiguous option: --{name}"),
                         });
                     }
 
-                    if let Some(option) = candidates.first() {
+                    if let Some(option) = string_candidates.first() {
                         matches
                             .options
+                            .push((option.name().to_owned(), value.to_owned()));
+                        index += 1;
+                        continue;
+                    }
+
+                    if let Some(option) = enum_candidates.first() {
+                        matches
+                            .enum_options
                             .push((option.name().to_owned(), value.to_owned()));
                         index += 1;
                         continue;
@@ -562,6 +749,16 @@ impl Command {
                         index += 2;
                         continue;
                     }
+                    Some(LongMatch::EnumOption(option)) => {
+                        let value = args.get(index + 1).ok_or_else(|| ParseError {
+                            message: format!("missing value for option: --{name}"),
+                        })?;
+                        matches
+                            .enum_options
+                            .push((option.name().to_owned(), value.to_owned()));
+                        index += 2;
+                        continue;
+                    }
                     None => {
                         return Err(ParseError {
                             message: format!("unknown flag: --{name}"),
@@ -574,17 +771,29 @@ impl Command {
                 if let Some((name, value)) = rest.split_once('=') {
                     if name.len() == 1 {
                         let short = name.chars().next().unwrap();
-                        let candidates = self.options_matching_short(short);
+                        let flag_candidates = self.flags_matching_short(short);
+                        let string_candidates = self.options_matching_short(short);
+                        let enum_candidates = self.enum_options_matching_short(short);
 
-                        if candidates.len() > 1 {
+                        if flag_candidates.len() + string_candidates.len() + enum_candidates.len()
+                            > 1
+                        {
                             return Err(ParseError {
                                 message: format!("ambiguous option: -{short}"),
                             });
                         }
 
-                        if let Some(option) = candidates.first() {
+                        if let Some(option) = string_candidates.first() {
                             matches
                                 .options
+                                .push((option.name().to_owned(), value.to_owned()));
+                            index += 1;
+                            continue;
+                        }
+
+                        if let Some(option) = enum_candidates.first() {
+                            matches
+                                .enum_options
                                 .push((option.name().to_owned(), value.to_owned()));
                             index += 1;
                             continue;
@@ -600,8 +809,9 @@ impl Command {
                     let short = rest.chars().next().unwrap();
                     let flag_candidates = self.flags_matching_short(short);
                     let option_candidates = self.options_matching_short(short);
+                    let enum_candidates = self.enum_options_matching_short(short);
 
-                    if flag_candidates.len() + option_candidates.len() > 1 {
+                    if flag_candidates.len() + option_candidates.len() + enum_candidates.len() > 1 {
                         return Err(ParseError {
                             message: format!("ambiguous option: -{short}"),
                         });
@@ -619,6 +829,17 @@ impl Command {
                         })?;
                         matches
                             .options
+                            .push((option.name().to_owned(), value.to_owned()));
+                        index += 2;
+                        continue;
+                    }
+
+                    if let Some(option) = enum_candidates.first() {
+                        let value = args.get(index + 1).ok_or_else(|| ParseError {
+                            message: format!("missing value for option: -{short}"),
+                        })?;
+                        matches
+                            .enum_options
                             .push((option.name().to_owned(), value.to_owned()));
                         index += 2;
                         continue;
@@ -695,6 +916,30 @@ impl Command {
                     });
                 }
                 None => {}
+            }
+        }
+
+        for option in &self.enum_options {
+            if matches.enum_option(option.name()).is_some() {
+                continue;
+            }
+
+            match option.default_value() {
+                Some(default) => matches
+                    .enum_options
+                    .push((option.name().to_owned(), default.to_owned())),
+                None if option.is_required() => {
+                    return Err(ParseError {
+                        message: format!("missing required option: --{}", option.name()),
+                    });
+                }
+                None => {}
+            }
+        }
+
+        for option in &self.enum_options {
+            if let Some(value) = matches.enum_option(option.name()) {
+                validate_enum_value(option, value)?;
             }
         }
 
@@ -1809,5 +2054,426 @@ mod tests {
         let matches = command.parse_from(["--no-color"]).unwrap();
 
         assert!(!matches.flag("color"));
+    }
+
+    #[test]
+    fn adds_enum_option_and_retains_allowed_values_in_order() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info", "warn", "error"]));
+
+        assert_eq!(command.enum_options().len(), 1);
+        assert_eq!(command.enum_options()[0].name(), "level");
+        assert_eq!(
+            command.enum_options()[0].values(),
+            ["debug", "info", "warn", "error"]
+        );
+    }
+
+    #[test]
+    fn enum_option_metadata_defaults_to_none() {
+        let option = EnumOption::new("level", ["debug", "info"]);
+
+        assert!(option.aliases().is_empty());
+        assert_eq!(option.get_description(), None);
+        assert_eq!(option.get_value_hint(), None);
+        assert!(!option.is_required());
+        assert_eq!(option.default_value(), None);
+    }
+
+    #[test]
+    fn configures_enum_option_metadata() {
+        let option = EnumOption::new("level", ["debug", "info", "warn", "error"])
+            .alias("l")
+            .alias("log-level")
+            .description("Logging level")
+            .value_hint("level")
+            .required()
+            .default("info");
+
+        assert_eq!(option.name(), "level");
+        assert_eq!(option.aliases(), ["l", "log-level"]);
+        assert_eq!(option.get_description(), Some("Logging level"));
+        assert_eq!(option.get_value_hint(), Some("level"));
+        assert!(option.is_required());
+        assert_eq!(option.default_value(), Some("info"));
+    }
+
+    #[test]
+    fn parses_enum_option_separate_token_and_equals() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("level", ["debug", "info"]));
+
+        let separate = command.parse_from(["--level", "info"]).unwrap();
+        let equals = command.parse_from(["--level=info"]).unwrap();
+
+        assert_eq!(separate.enum_option("level"), Some("info"));
+        assert_eq!(equals.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn rejects_invalid_enum_value() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info", "warn", "error"]));
+
+        let error = command.parse_from(["--level", "verbose"]).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "invalid value for option: --level: verbose (expected one of: debug, info, warn, error)"
+        );
+    }
+
+    #[test]
+    fn enum_validation_is_case_sensitive() {
+        let command = Command::new("ritty").enum_option(EnumOption::new("level", ["info"]));
+
+        let error = command.parse_from(["--level", "INFO"]).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "invalid value for option: --level: INFO (expected one of: info)"
+        );
+    }
+
+    #[test]
+    fn empty_allowed_value_list_accepts_anything() {
+        let command = Command::new("ritty").enum_option(EnumOption::new("level", [] as [&str; 0]));
+
+        let matches = command.parse_from(["--level", "anything"]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("anything"));
+    }
+
+    #[test]
+    fn missing_optional_enum_option_remains_absent() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("level", ["debug", "info"]));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), None);
+    }
+
+    #[test]
+    fn missing_enum_option_uses_default() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).default("info"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn explicit_enum_value_overrides_default() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).default("info"));
+
+        let separate = command.parse_from(["--level", "debug"]).unwrap();
+
+        assert_eq!(separate.enum_option("level"), Some("debug"));
+    }
+
+    #[test]
+    fn explicit_equals_enum_value_overrides_default() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).default("info"));
+
+        let matches = command.parse_from(["--level=debug"]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("debug"));
+    }
+
+    #[test]
+    fn invalid_effective_enum_default_errors() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).default("verbose"));
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "invalid value for option: --level: verbose (expected one of: debug, info)"
+        );
+    }
+
+    #[test]
+    fn valid_explicit_enum_value_beats_invalid_unused_default() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).default("verbose"));
+
+        let matches = command.parse_from(["--level", "info"]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn rejects_missing_required_enum_option() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).required());
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.message(), "missing required option: --level");
+    }
+
+    #[test]
+    fn required_enum_option_satisfied_by_separate_explicit() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).required());
+
+        let matches = command.parse_from(["--level", "info"]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn required_enum_option_satisfied_by_equals_explicit() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).required());
+
+        let matches = command.parse_from(["--level=info"]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn required_enum_option_satisfied_by_valid_default() {
+        let command = Command::new("ritty").enum_option(
+            EnumOption::new("level", ["debug", "info"])
+                .required()
+                .default("info"),
+        );
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn required_enum_option_with_invalid_default_errors() {
+        let command = Command::new("ritty").enum_option(
+            EnumOption::new("level", ["debug", "info"])
+                .required()
+                .default("verbose"),
+        );
+
+        let error = command.parse_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "invalid value for option: --level: verbose (expected one of: debug, info)"
+        );
+    }
+
+    #[test]
+    fn parses_short_enum_option_alias_separate_and_equals() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).alias("l"));
+
+        let separate = command.parse_from(["-l", "info"]).unwrap();
+        let equals = command.parse_from(["-l=info"]).unwrap();
+
+        assert_eq!(separate.enum_option("level"), Some("info"));
+        assert_eq!(equals.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn parses_long_enum_option_alias_separate_and_equals() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).alias("log-level"));
+
+        let separate = command.parse_from(["--log-level", "info"]).unwrap();
+        let equals = command.parse_from(["--log-level=info"]).unwrap();
+
+        assert_eq!(separate.enum_option("level"), Some("info"));
+        assert_eq!(equals.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn all_enum_alias_spellings_resolve_to_canonical_name() {
+        let command = Command::new("ritty").enum_option(
+            EnumOption::new("level", ["debug", "info"])
+                .alias("l")
+                .alias("log-level"),
+        );
+
+        for args in [
+            &["--level", "info"][..],
+            &["-l", "info"][..],
+            &["-l=info"][..],
+            &["--log-level", "info"][..],
+            &["--log-level=info"][..],
+        ] {
+            let matches = command.parse_from(args.to_vec()).unwrap();
+            assert_eq!(matches.enum_option("level"), Some("info"));
+        }
+    }
+
+    #[test]
+    fn enum_alias_value_overrides_default() {
+        let command = Command::new("ritty").enum_option(
+            EnumOption::new("level", ["debug", "info"])
+                .alias("l")
+                .default("info"),
+        );
+
+        let matches = command.parse_from(["-l", "debug"]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("debug"));
+    }
+
+    #[test]
+    fn enum_option_consumes_hyphen_prefixed_allowed_value() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("mode", ["-fast", "--safe"]));
+
+        let fast = command.parse_from(["--mode", "-fast"]).unwrap();
+        let safe = command.parse_from(["--mode", "--safe"]).unwrap();
+
+        assert_eq!(fast.enum_option("mode"), Some("-fast"));
+        assert_eq!(safe.enum_option("mode"), Some("--safe"));
+    }
+
+    #[test]
+    fn enum_value_matching_subcommand_is_not_mistaken_for_subcommand() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("target", ["build", "test"]))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--target", "build"]).unwrap();
+
+        assert_eq!(matches.enum_option("target"), Some("build"));
+        assert_eq!(matches.subcommand(), None);
+    }
+
+    #[test]
+    fn subcommand_resolves_after_consumed_enum_value() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("target", ["build", "test"]))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--target", "test", "build"]).unwrap();
+
+        assert_eq!(matches.enum_option("target"), Some("test"));
+        assert_eq!(matches.subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn enum_option_value_does_not_advance_positional_cursor() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]))
+            .arg(Arg::new("target"));
+
+        let matches = command.parse_from(["--level", "info", "world"]).unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("info"));
+        assert_eq!(matches.argument("target"), Some("world"));
+    }
+
+    #[test]
+    fn canonical_enum_option_repeated_uses_first_occurrence() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("level", ["debug", "info"]));
+
+        let matches = command
+            .parse_from(["--level", "info", "--level", "debug"])
+            .unwrap();
+
+        assert_eq!(matches.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn string_option_and_enum_option_long_collision_errors() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("mode"))
+            .enum_option(EnumOption::new("mode", ["fast", "safe"]));
+
+        let error = command.parse_from(["--mode"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: --mode");
+    }
+
+    #[test]
+    fn flag_and_enum_option_long_collision_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("mode"))
+            .enum_option(EnumOption::new("mode", ["fast", "safe"]));
+
+        let bare = command.parse_from(["--mode"]).unwrap_err();
+        let equals = command.parse_from(["--mode=fast"]).unwrap_err();
+
+        assert_eq!(bare.message(), "ambiguous option: --mode");
+        assert_eq!(equals.message(), "ambiguous option: --mode");
+    }
+
+    #[test]
+    fn boolean_negation_and_enum_option_no_prefix_collision_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("cache"))
+            .enum_option(EnumOption::new("no-cache", ["on", "off"]));
+
+        let error = command.parse_from(["--no-cache"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: --no-cache");
+    }
+
+    #[test]
+    fn string_option_and_enum_option_short_alias_collision_errors() {
+        let command = Command::new("ritty")
+            .option(StringOption::new("output").alias("o"))
+            .enum_option(EnumOption::new("format", ["json", "text"]).alias("o"));
+
+        let error = command.parse_from(["-o", "x"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: -o");
+    }
+
+    #[test]
+    fn boolean_and_enum_option_short_collision_errors() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose").short('v'))
+            .enum_option(EnumOption::new("value", ["a", "b"]).alias("v"));
+
+        let error = command.parse_from(["-v"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: -v");
+    }
+
+    #[test]
+    fn multiple_enum_options_sharing_alias_collision_errors() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("first", ["a"]).alias("x"))
+            .enum_option(EnumOption::new("second", ["a"]).alias("x"));
+
+        let error = command.parse_from(["-x", "a"]).unwrap_err();
+
+        assert_eq!(error.message(), "ambiguous option: -x");
+    }
+
+    #[test]
+    fn enum_option_equals_value_preserves_extra_equals() {
+        let command =
+            Command::new("ritty").enum_option(EnumOption::new("mode", ["a=b"]).alias("m"));
+
+        let long = command.parse_from(["--mode=a=b"]).unwrap();
+        let short = command.parse_from(["-m=a=b"]).unwrap();
+
+        assert_eq!(long.enum_option("mode"), Some("a=b"));
+        assert_eq!(short.enum_option("mode"), Some("a=b"));
+    }
+
+    #[test]
+    fn enum_option_explicit_empty_value_is_validated_not_treated_as_absent() {
+        let allowed = Command::new("ritty").enum_option(EnumOption::new("mode", ["", "a"]));
+        let matches = allowed.parse_from(["--mode="]).unwrap();
+        assert_eq!(matches.enum_option("mode"), Some(""));
+
+        let disallowed = Command::new("ritty").enum_option(EnumOption::new("mode", ["a"]));
+        let error = disallowed.parse_from(["--mode="]).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "invalid value for option: --mode:  (expected one of: a)"
+        );
     }
 }
