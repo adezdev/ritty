@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::iter::once;
+use std::sync::Arc;
 
 /// A positional argument in a Ritty command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -917,7 +918,91 @@ fn render_usage_line(command: &Command, display_name: &str) -> String {
 }
 
 /// A command in a Ritty CLI application.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The context handed to a command's handler when it runs.
+///
+/// `matches()` is the selected command's own parsed matches; `root_matches()`
+/// is the complete top-level parse result, so a nested handler can still
+/// inspect parent/global options without Ritty flattening match ownership.
+#[derive(Debug)]
+pub struct CommandContext<'a> {
+    command: &'a Command,
+    matches: &'a Matches,
+    root_matches: &'a Matches,
+}
+
+impl<'a> CommandContext<'a> {
+    /// Returns the command whose handler is executing.
+    pub fn command(&self) -> &Command {
+        self.command
+    }
+
+    /// Returns the executing command's own parsed matches.
+    pub fn matches(&self) -> &Matches {
+        self.matches
+    }
+
+    /// Returns the complete top-level parsed result.
+    pub fn root_matches(&self) -> &Matches {
+        self.root_matches
+    }
+}
+
+/// A boxed error, as returned by a failing handler.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// The result returned by a command handler.
+pub type HandlerResult = Result<(), BoxError>;
+
+/// A shared, cloneable handler callable. Wrapped so `Command` can derive a
+/// meaningful `Debug` without trying to print closure internals.
+#[derive(Clone)]
+struct Handler(Arc<dyn for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync>);
+
+impl std::fmt::Debug for Handler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Handler(..)")
+    }
+}
+
+/// An error produced while executing a parsed command.
+#[derive(Debug)]
+pub enum RunError {
+    /// Parsing the given arguments failed; the original `ParseError` is preserved.
+    Parse(ParseError),
+    /// No handler could be selected: a command has subcommands, none was
+    /// selected (explicitly or via default), and the command itself has no handler.
+    NoCommand,
+    /// The selected handler returned an error.
+    Handler(BoxError),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Parse(err) => write!(f, "{err}"),
+            RunError::NoCommand => f.write_str("no command specified"),
+            RunError::Handler(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RunError::Parse(err) => Some(err),
+            RunError::NoCommand => None,
+            RunError::Handler(err) => Some(err.as_ref()),
+        }
+    }
+}
+
+impl From<ParseError> for RunError {
+    fn from(err: ParseError) -> Self {
+        RunError::Parse(err)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Command {
     name: String,
     aliases: Vec<String>,
@@ -930,6 +1015,7 @@ pub struct Command {
     enum_options: Vec<EnumOption>,
     default_subcommand: Option<String>,
     hidden: bool,
+    handler: Option<Handler>,
 }
 
 impl Command {
@@ -947,7 +1033,23 @@ impl Command {
             enum_options: Vec::new(),
             default_subcommand: None,
             hidden: false,
+            handler: None,
         }
+    }
+
+    /// Sets the command's handler, invoked when this command is selected for
+    /// execution by `run_from`. Ordinary captured closures are supported.
+    pub fn handler<F>(mut self, handler: F) -> Self
+    where
+        F: for<'a> Fn(&CommandContext<'a>) -> HandlerResult + Send + Sync + 'static,
+    {
+        self.handler = Some(Handler(Arc::new(handler)));
+        self
+    }
+
+    /// Returns whether the command has a handler set.
+    pub fn has_handler(&self) -> bool {
+        self.handler.is_some()
     }
 
     /// Marks the command as hidden from generated usage/help listings.
@@ -1294,6 +1396,61 @@ impl Command {
             .map(|arg| arg.as_ref().to_owned())
             .collect();
         self.parse_tokens(&args)
+    }
+
+    /// Parses `args` and executes the selected command's handler.
+    ///
+    /// Parsing runs exactly once; execution then traverses `Command` and the
+    /// resulting `Matches` tree together, following the canonical subcommand
+    /// selection parsing already made (explicit, aliased, or default) rather
+    /// than re-examining argv. Only the selected leaf's handler runs — a
+    /// parent's handler is not invoked when a child is selected.
+    ///
+    /// This is a synchronous, programmatic API: it does not read
+    /// `std::env::args`, print, exit, render usage, or special-case
+    /// help/version.
+    pub fn run_from<I, S>(&self, args: I) -> Result<(), RunError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let matches = self.parse_from(args)?;
+        self.execute(&matches, &matches)
+    }
+
+    /// Executes the handler selected by `matches`, recursing into a selected
+    /// child by its canonical name rather than re-resolving aliases.
+    fn execute<'a>(
+        &'a self,
+        matches: &'a Matches,
+        root_matches: &'a Matches,
+    ) -> Result<(), RunError> {
+        if let Some(name) = matches.subcommand() {
+            let child = self
+                .subcommands
+                .iter()
+                .find(|child| child.name() == name)
+                .expect("a parser-selected canonical subcommand always exists in the command tree");
+            let child_matches = matches
+                .subcommand_matches()
+                .expect("a selected subcommand always carries its own matches");
+            return child.execute(child_matches, root_matches);
+        }
+
+        if let Some(handler) = &self.handler {
+            let context = CommandContext {
+                command: self,
+                matches,
+                root_matches,
+            };
+            return (handler.0)(&context).map_err(RunError::Handler);
+        }
+
+        if self.subcommands.is_empty() {
+            return Ok(());
+        }
+
+        Err(RunError::NoCommand)
     }
 
     /// Parses a slice of already-collected argv tokens against this command,
@@ -5153,5 +5310,389 @@ mod tests {
         let error = command.parse_from(["--wat"]).unwrap_err();
 
         assert_error(&error);
+    }
+
+    // --- Execution ---
+
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct Boom;
+
+    impl std::fmt::Display for Boom {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("boom")
+        }
+    }
+
+    impl std::error::Error for Boom {}
+
+    #[test]
+    fn handler_defaults_to_absent() {
+        let command = Command::new("root");
+
+        assert!(!command.has_handler());
+    }
+
+    #[test]
+    fn root_handler_executes() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root").handler(move |_ctx| {
+            recorded.lock().unwrap().push("root");
+            Ok(())
+        });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["root"]);
+    }
+
+    #[test]
+    fn handler_receives_its_local_matches() {
+        let command = Command::new("root").arg(Arg::new("name")).handler(|ctx| {
+            assert_eq!(ctx.matches().argument("name"), Some("alice"));
+            Ok(())
+        });
+
+        command.run_from(["alice"]).unwrap();
+    }
+
+    #[test]
+    fn handler_receives_root_matches() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose").short('v'))
+            .command(Command::new("build").handler(|ctx| {
+                assert!(ctx.root_matches().flag("verbose"));
+                assert_eq!(ctx.root_matches().subcommand(), Some("build"));
+                Ok(())
+            }));
+
+        command.run_from(["-v", "build"]).unwrap();
+    }
+
+    #[test]
+    fn captured_closure_handler_works() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("build").handler(move |_ctx| {
+            recorded.lock().unwrap().push("build");
+            Ok(())
+        });
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["build"]);
+    }
+
+    #[test]
+    fn cloned_command_retains_working_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root").handler(move |_ctx| {
+            recorded.lock().unwrap().push("root");
+            Ok(())
+        });
+
+        let cloned = command.clone();
+        cloned.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["root"]);
+    }
+
+    #[test]
+    fn root_options_are_parsed_before_root_handler_runs() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose").short('v'))
+            .handler(|ctx| {
+                assert!(ctx.matches().flag("verbose"));
+                Ok(())
+            });
+
+        command.run_from(["-v"]).unwrap();
+    }
+
+    #[test]
+    fn explicit_child_handler_executes() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root").command(Command::new("build").handler(move |_ctx| {
+            recorded.lock().unwrap().push("build");
+            Ok(())
+        }));
+
+        command.run_from(["build"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["build"]);
+    }
+
+    #[test]
+    fn parent_handler_is_suppressed_when_child_selected() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_calls = Arc::clone(&calls);
+        let build_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .handler(move |_ctx| {
+                root_calls.lock().unwrap().push("root");
+                Ok(())
+            })
+            .command(Command::new("build").handler(move |_ctx| {
+                build_calls.lock().unwrap().push("build");
+                Ok(())
+            }));
+
+        command.run_from(["build"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["build"]);
+    }
+
+    #[test]
+    fn subcommand_alias_executes_canonical_child_handler() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command =
+            Command::new("root").command(Command::new("build").alias("b").handler(move |_ctx| {
+                recorded.lock().unwrap().push("build");
+                Ok(())
+            }));
+
+        command.run_from(["b"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["build"]);
+    }
+
+    #[test]
+    fn nested_leaf_handler_executes() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root").command(Command::new("remote").command(
+            Command::new("add").handler(move |_ctx| {
+                recorded.lock().unwrap().push("add");
+                Ok(())
+            }),
+        ));
+
+        command.run_from(["remote", "add"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["add"]);
+    }
+
+    #[test]
+    fn intermediate_parent_handlers_are_not_executed() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let root_calls = Arc::clone(&calls);
+        let remote_calls = Arc::clone(&calls);
+        let add_calls = Arc::clone(&calls);
+        let command = Command::new("root")
+            .handler(move |_ctx| {
+                root_calls.lock().unwrap().push("root");
+                Ok(())
+            })
+            .command(
+                Command::new("remote")
+                    .handler(move |_ctx| {
+                        remote_calls.lock().unwrap().push("remote");
+                        Ok(())
+                    })
+                    .command(Command::new("add").handler(move |_ctx| {
+                        add_calls.lock().unwrap().push("add");
+                        Ok(())
+                    })),
+            );
+
+        command.run_from(["remote", "add"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["add"]);
+    }
+
+    #[test]
+    fn default_child_handler_executes_on_empty_argv() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command =
+            Command::new("root")
+                .default_subcommand("dev")
+                .command(Command::new("dev").handler(move |_ctx| {
+                    recorded.lock().unwrap().push("dev");
+                    Ok(())
+                }));
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["dev"]);
+    }
+
+    #[test]
+    fn default_subcommand_alias_executes_canonical_child() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root").default_subcommand("d").command(
+            Command::new("dev").alias("d").handler(move |_ctx| {
+                recorded.lock().unwrap().push("dev");
+                Ok(())
+            }),
+        );
+
+        command.run_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["dev"]);
+    }
+
+    #[test]
+    fn hidden_subcommand_remains_executable() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let command =
+            Command::new("root").command(Command::new("secret").hidden().handler(move |_ctx| {
+                recorded.lock().unwrap().push("secret");
+                Ok(())
+            }));
+
+        command.run_from(["secret"]).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["secret"]);
+    }
+
+    #[test]
+    fn child_handler_receives_child_matches() {
+        let command =
+            Command::new("root").command(Command::new("build").arg(Arg::new("target")).handler(
+                |ctx| {
+                    assert_eq!(ctx.matches().argument("target"), Some("web"));
+                    Ok(())
+                },
+            ));
+
+        command.run_from(["build", "web"]).unwrap();
+    }
+
+    #[test]
+    fn child_handler_can_inspect_parent_and_root_matches() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose").short('v'))
+            .command(Command::new("build").handler(|ctx| {
+                assert!(ctx.root_matches().flag("verbose"));
+                assert!(ctx.matches().argument("target").is_none());
+                Ok(())
+            }));
+
+        command.run_from(["-v", "build"]).unwrap();
+    }
+
+    #[test]
+    fn parse_failure_becomes_run_error_parse() {
+        let command = Command::new("root");
+
+        let error = command.run_from(["--wat"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+    }
+
+    #[test]
+    fn run_error_parse_kind_is_preserved() {
+        let command = Command::new("root");
+
+        let error = command.run_from(["--wat"]).unwrap_err();
+
+        let RunError::Parse(parse_error) = error else {
+            panic!("expected RunError::Parse");
+        };
+        assert_eq!(
+            parse_error.kind(),
+            ParseErrorKind::Argument(ArgumentErrorKind::UnknownOption)
+        );
+    }
+
+    #[test]
+    fn run_error_parse_message_is_preserved() {
+        let command = Command::new("root");
+
+        let direct = command.parse_from(["--wat"]).unwrap_err();
+        let error = command.run_from(["--wat"]).unwrap_err();
+
+        let RunError::Parse(parse_error) = error else {
+            panic!("expected RunError::Parse");
+        };
+        assert_eq!(parse_error.message(), direct.message());
+    }
+
+    #[test]
+    fn unresolved_required_child_returns_no_command() {
+        let command = Command::new("root").command(Command::new("build").handler(|_ctx| Ok(())));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::NoCommand));
+    }
+
+    #[test]
+    fn empty_no_handler_command_succeeds_as_no_op() {
+        let command = Command::new("root");
+
+        command.run_from([] as [&str; 0]).unwrap();
+    }
+
+    #[test]
+    fn selected_leaf_without_handler_succeeds_as_no_op() {
+        let command = Command::new("root").command(Command::new("build"));
+
+        command.run_from(["build"]).unwrap();
+    }
+
+    #[test]
+    fn handler_failure_becomes_handler_error_variant() {
+        let command = Command::new("root").handler(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert!(matches!(error, RunError::Handler(_)));
+    }
+
+    #[test]
+    fn handler_error_is_exposed_through_source() {
+        let command = Command::new("root").handler(|_ctx| Err(Box::new(Boom) as BoxError));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        let source = std::error::Error::source(&error).expect("handler error has a source");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn run_error_implements_display() {
+        let command = Command::new("root").command(Command::new("build").handler(|_ctx| Ok(())));
+
+        let error = command.run_from([] as [&str; 0]).unwrap_err();
+
+        assert_eq!(error.to_string(), "no command specified");
+    }
+
+    #[test]
+    fn run_error_implements_std_error() {
+        fn assert_error<E: std::error::Error>(_: &E) {}
+
+        let command = Command::new("root");
+        let error = command.run_from(["--wat"]).unwrap_err();
+
+        assert_error(&error);
+    }
+
+    #[test]
+    fn parse_error_prevents_any_handler_call() {
+        let calls = Arc::new(Mutex::new(0));
+        let recorded = Arc::clone(&calls);
+        let command = Command::new("root")
+            .handler(move |_ctx| {
+                *recorded.lock().unwrap() += 1;
+                Ok(())
+            })
+            .command(Command::new("build").handler(|_ctx| {
+                panic!("child handler must not run on parse failure");
+            }));
+
+        let error = command.run_from(["--wat"]).unwrap_err();
+
+        assert!(matches!(error, RunError::Parse(_)));
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 }
