@@ -455,6 +455,81 @@ enum LongMatch<'a> {
     EnumOption(&'a EnumOption),
 }
 
+/// Resolution of a bare short-option token to a flag, string option, or enum option.
+enum ShortMatch<'a> {
+    Flag(&'a Flag),
+    Option(&'a StringOption),
+    EnumOption(&'a EnumOption),
+}
+
+/// Whether a recognized option consumes a following token as its value.
+enum OptionArity {
+    Flag,
+    Value,
+}
+
+/// Determines whether `name` is recognized as a bare long option by
+/// `command`, or transitively by its default-subcommand chain, and if so
+/// with what arity. Used to decide, at the level currently being parsed, how
+/// many raw tokens to hold back for a default child without fully resolving
+/// the option there — the child (or its own default chain) re-resolves and
+/// consumes the held-back tokens itself.
+fn probe_long(command: &Command, name: &str) -> Result<Option<OptionArity>, ParseError> {
+    if let Some(m) = command.resolve_long(name)? {
+        return Ok(Some(match m {
+            LongMatch::Flag(_, _) => OptionArity::Flag,
+            LongMatch::Option(_) | LongMatch::EnumOption(_) => OptionArity::Value,
+        }));
+    }
+
+    match command.resolve_default_child()? {
+        Some(next) => probe_long(next, name),
+        None => Ok(None),
+    }
+}
+
+/// Short-option counterpart to `probe_long`.
+fn probe_short(command: &Command, short: char) -> Result<Option<OptionArity>, ParseError> {
+    if let Some(m) = command.resolve_short(short)? {
+        return Ok(Some(match m {
+            ShortMatch::Flag(_) => OptionArity::Flag,
+            ShortMatch::Option(_) | ShortMatch::EnumOption(_) => OptionArity::Value,
+        }));
+    }
+
+    match command.resolve_default_child()? {
+        Some(next) => probe_short(next, short),
+        None => Ok(None),
+    }
+}
+
+/// Determines whether `--name=value` is recognized by `command`, or
+/// transitively by its default-subcommand chain.
+fn probe_long_equals(command: &Command, name: &str) -> Result<bool, ParseError> {
+    let (string_match, enum_match) = command.long_equals_candidates(name)?;
+    if string_match.is_some() || enum_match.is_some() {
+        return Ok(true);
+    }
+
+    match command.resolve_default_child()? {
+        Some(next) => probe_long_equals(next, name),
+        None => Ok(false),
+    }
+}
+
+/// Short-option counterpart to `probe_long_equals`.
+fn probe_short_equals(command: &Command, short: char) -> Result<bool, ParseError> {
+    let (string_match, enum_match) = command.short_equals_candidates(short)?;
+    if string_match.is_some() || enum_match.is_some() {
+        return Ok(true);
+    }
+
+    match command.resolve_default_child()? {
+        Some(next) => probe_short_equals(next, short),
+        None => Ok(false),
+    }
+}
+
 /// Validates an enum option's effective value against its allowed values.
 /// An empty allowed-value list means there is no restriction.
 fn validate_enum_value(option: &EnumOption, value: &str) -> Result<(), ParseError> {
@@ -707,6 +782,110 @@ impl Command {
         Ok(None)
     }
 
+    /// Resolves a bare short-option token (no `=`) against declared flags,
+    /// string options, and enum options, erroring on ambiguity.
+    fn resolve_short(&self, short: char) -> Result<Option<ShortMatch<'_>>, ParseError> {
+        let flag_candidates = self.flags_matching_short(short);
+        let option_candidates = self.options_matching_short(short);
+        let enum_candidates = self.enum_options_matching_short(short);
+
+        if flag_candidates.len() + option_candidates.len() + enum_candidates.len() > 1 {
+            return Err(ParseError {
+                message: format!("ambiguous option: -{short}"),
+            });
+        }
+
+        if let Some(flag) = flag_candidates.first() {
+            return Ok(Some(ShortMatch::Flag(flag)));
+        }
+
+        if let Some(option) = option_candidates.first() {
+            return Ok(Some(ShortMatch::Option(option)));
+        }
+
+        if let Some(option) = enum_candidates.first() {
+            return Ok(Some(ShortMatch::EnumOption(option)));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolves a `--name=value` long-option token to whichever value-bearing
+    /// schema entry owns `name`. Flags participate only in the ambiguity
+    /// count: `--flag=value` is never a valid spelling for a boolean flag.
+    fn long_equals_candidates(
+        &self,
+        name: &str,
+    ) -> Result<(Option<&StringOption>, Option<&EnumOption>), ParseError> {
+        let positive_flags = self.flags_matching_long(name);
+        let negative_flags = name
+            .strip_prefix("no-")
+            .map(|base| self.flags_matching_long(base))
+            .unwrap_or_default();
+        let string_candidates = self.options_matching_long(name);
+        let enum_candidates = self.enum_options_matching_long(name);
+
+        if positive_flags.len()
+            + negative_flags.len()
+            + string_candidates.len()
+            + enum_candidates.len()
+            > 1
+        {
+            return Err(ParseError {
+                message: format!("ambiguous option: --{name}"),
+            });
+        }
+
+        Ok((
+            string_candidates.first().copied(),
+            enum_candidates.first().copied(),
+        ))
+    }
+
+    /// Resolves a `-x=value` short-option token, mirroring `long_equals_candidates`.
+    fn short_equals_candidates(
+        &self,
+        short: char,
+    ) -> Result<(Option<&StringOption>, Option<&EnumOption>), ParseError> {
+        let flag_candidates = self.flags_matching_short(short);
+        let string_candidates = self.options_matching_short(short);
+        let enum_candidates = self.enum_options_matching_short(short);
+
+        if flag_candidates.len() + string_candidates.len() + enum_candidates.len() > 1 {
+            return Err(ParseError {
+                message: format!("ambiguous option: -{short}"),
+            });
+        }
+
+        Ok((
+            string_candidates.first().copied(),
+            enum_candidates.first().copied(),
+        ))
+    }
+
+    /// Resolves the configured default subcommand to its concrete child,
+    /// re-checking alias/name collisions at each call site that needs it.
+    /// Returns `Ok(None)` when no default subcommand is configured.
+    fn resolve_default_child(&self) -> Result<Option<&Command>, ParseError> {
+        let Some(default_name) = &self.default_subcommand else {
+            return Ok(None);
+        };
+
+        let candidates = self.subcommands_matching(default_name);
+
+        if candidates.len() > 1 {
+            return Err(ParseError {
+                message: format!("ambiguous command: {default_name}"),
+            });
+        }
+
+        let child = candidates.first().copied().ok_or_else(|| ParseError {
+            message: format!("default subcommand not found: {default_name}"),
+        })?;
+
+        Ok(Some(child))
+    }
+
     /// Parses command-line arguments.
     pub fn parse_from<I, S>(&self, args: I) -> Result<Matches, ParseError>
     where
@@ -722,6 +901,14 @@ impl Command {
 
     /// Parses a slice of already-collected argv tokens against this command,
     /// recursing into a selected subcommand's own tokens once one is found.
+    ///
+    /// When no explicit child is selected and a default subcommand is
+    /// configured, tokens this command's own schema does not recognize are
+    /// held back into `child_tokens` and handed to the default child's own
+    /// `parse_tokens` afterward, rather than being replayed verbatim the way
+    /// Citty's `strict: false` parser does. This keeps unknown-input errors
+    /// meaningful (a token accepted by neither command still errors) while
+    /// letting the default child receive real argv instead of only defaults.
     fn parse_tokens(&self, args: &[String]) -> Result<Matches, ParseError> {
         let mut matches = Matches {
             flags: Vec::new(),
@@ -732,107 +919,27 @@ impl Command {
             subcommand_matches: None,
         };
         let mut positional = 0;
+        let mut terminated = false;
+        let mut child_tokens: Vec<String> = Vec::new();
+        let mut child_terminator_sent = false;
 
         let mut index = 0;
 
         while index < args.len() {
             let arg = args[index].as_str();
 
-            if let Some(rest) = arg.strip_prefix("--") {
-                if let Some((name, value)) = rest.split_once('=') {
-                    let positive_flags = self.flags_matching_long(name);
-                    let negative_flags = name
-                        .strip_prefix("no-")
-                        .map(|base| self.flags_matching_long(base))
-                        .unwrap_or_default();
-                    let string_candidates = self.options_matching_long(name);
-                    let enum_candidates = self.enum_options_matching_long(name);
-
-                    if positive_flags.len()
-                        + negative_flags.len()
-                        + string_candidates.len()
-                        + enum_candidates.len()
-                        > 1
-                    {
-                        return Err(ParseError {
-                            message: format!("ambiguous option: --{name}"),
-                        });
-                    }
-
-                    if let Some(option) = string_candidates.first() {
-                        matches
-                            .options
-                            .push((option.name().to_owned(), value.to_owned()));
-                        index += 1;
-                        continue;
-                    }
-
-                    if let Some(option) = enum_candidates.first() {
-                        matches
-                            .enum_options
-                            .push((option.name().to_owned(), value.to_owned()));
-                        index += 1;
-                        continue;
-                    }
-
-                    return Err(ParseError {
-                        message: format!("unknown flag: --{name}"),
-                    });
-                }
-
-                let name = rest;
-
-                match self.resolve_long(name)? {
-                    Some(LongMatch::Flag(flag, value)) => {
-                        matches.set_flag(flag.name(), value);
-                        index += 1;
-                        continue;
-                    }
-                    Some(LongMatch::Option(option)) => {
-                        let value = args.get(index + 1).ok_or_else(|| ParseError {
-                            message: format!("missing value for option: --{name}"),
-                        })?;
-                        matches
-                            .options
-                            .push((option.name().to_owned(), value.to_owned()));
-                        index += 2;
-                        continue;
-                    }
-                    Some(LongMatch::EnumOption(option)) => {
-                        let value = args.get(index + 1).ok_or_else(|| ParseError {
-                            message: format!("missing value for option: --{name}"),
-                        })?;
-                        matches
-                            .enum_options
-                            .push((option.name().to_owned(), value.to_owned()));
-                        index += 2;
-                        continue;
-                    }
-                    None => {
-                        return Err(ParseError {
-                            message: format!("unknown flag: --{name}"),
-                        });
-                    }
-                }
+            if !terminated && arg == "--" {
+                terminated = true;
+                index += 1;
+                continue;
             }
 
-            if let Some(rest) = arg.strip_prefix('-') {
-                if let Some((name, value)) = rest.split_once('=') {
-                    if name.len() == 1 {
-                        let short = name.chars().next().unwrap();
-                        let flag_candidates = self.flags_matching_short(short);
-                        let string_candidates = self.options_matching_short(short);
-                        let enum_candidates = self.enum_options_matching_short(short);
+            if !terminated {
+                if let Some(rest) = arg.strip_prefix("--") {
+                    if let Some((name, value)) = rest.split_once('=') {
+                        let (string_match, enum_match) = self.long_equals_candidates(name)?;
 
-                        if flag_candidates.len() + string_candidates.len() + enum_candidates.len()
-                            > 1
-                        {
-                            return Err(ParseError {
-                                message: format!("ambiguous option: -{short}"),
-                            });
-                        }
-
-                        if let Some(option) = string_candidates.first() {
+                        if let Some(option) = string_match {
                             matches
                                 .options
                                 .push((option.name().to_owned(), value.to_owned()));
@@ -840,12 +947,171 @@ impl Command {
                             continue;
                         }
 
-                        if let Some(option) = enum_candidates.first() {
+                        if let Some(option) = enum_match {
                             matches
                                 .enum_options
                                 .push((option.name().to_owned(), value.to_owned()));
                             index += 1;
                             continue;
+                        }
+
+                        if let Some(child) = self.resolve_default_child()?
+                            && probe_long_equals(child, name)?
+                        {
+                            child_tokens.push(arg.to_owned());
+                            index += 1;
+                            continue;
+                        }
+
+                        return Err(ParseError {
+                            message: format!("unknown flag: --{name}"),
+                        });
+                    }
+
+                    let name = rest;
+
+                    match self.resolve_long(name)? {
+                        Some(LongMatch::Flag(flag, value)) => {
+                            matches.set_flag(flag.name(), value);
+                            index += 1;
+                            continue;
+                        }
+                        Some(LongMatch::Option(option)) => {
+                            let value = args.get(index + 1).ok_or_else(|| ParseError {
+                                message: format!("missing value for option: --{name}"),
+                            })?;
+                            matches
+                                .options
+                                .push((option.name().to_owned(), value.to_owned()));
+                            index += 2;
+                            continue;
+                        }
+                        Some(LongMatch::EnumOption(option)) => {
+                            let value = args.get(index + 1).ok_or_else(|| ParseError {
+                                message: format!("missing value for option: --{name}"),
+                            })?;
+                            matches
+                                .enum_options
+                                .push((option.name().to_owned(), value.to_owned()));
+                            index += 2;
+                            continue;
+                        }
+                        None => {
+                            if let Some(child) = self.resolve_default_child()? {
+                                match probe_long(child, name)? {
+                                    Some(OptionArity::Flag) => {
+                                        child_tokens.push(arg.to_owned());
+                                        index += 1;
+                                        continue;
+                                    }
+                                    Some(OptionArity::Value) => {
+                                        child_tokens.push(arg.to_owned());
+                                        if let Some(value) = args.get(index + 1) {
+                                            child_tokens.push(value.clone());
+                                            index += 2;
+                                        } else {
+                                            index += 1;
+                                        }
+                                        continue;
+                                    }
+                                    None => {}
+                                }
+                            }
+
+                            return Err(ParseError {
+                                message: format!("unknown flag: --{name}"),
+                            });
+                        }
+                    }
+                }
+
+                if let Some(rest) = arg.strip_prefix('-') {
+                    if let Some((name, value)) = rest.split_once('=') {
+                        if name.len() == 1 {
+                            let short = name.chars().next().unwrap();
+                            let (string_match, enum_match) = self.short_equals_candidates(short)?;
+
+                            if let Some(option) = string_match {
+                                matches
+                                    .options
+                                    .push((option.name().to_owned(), value.to_owned()));
+                                index += 1;
+                                continue;
+                            }
+
+                            if let Some(option) = enum_match {
+                                matches
+                                    .enum_options
+                                    .push((option.name().to_owned(), value.to_owned()));
+                                index += 1;
+                                continue;
+                            }
+
+                            if let Some(child) = self.resolve_default_child()?
+                                && probe_short_equals(child, short)?
+                            {
+                                child_tokens.push(arg.to_owned());
+                                index += 1;
+                                continue;
+                            }
+                        }
+
+                        return Err(ParseError {
+                            message: format!("unknown flag: -{rest}"),
+                        });
+                    }
+
+                    if rest.len() == 1 {
+                        let short = rest.chars().next().unwrap();
+
+                        match self.resolve_short(short)? {
+                            Some(ShortMatch::Flag(flag)) => {
+                                matches.set_flag(flag.name(), true);
+                                index += 1;
+                                continue;
+                            }
+                            Some(ShortMatch::Option(option)) => {
+                                let value = args.get(index + 1).ok_or_else(|| ParseError {
+                                    message: format!("missing value for option: -{short}"),
+                                })?;
+                                matches
+                                    .options
+                                    .push((option.name().to_owned(), value.to_owned()));
+                                index += 2;
+                                continue;
+                            }
+                            Some(ShortMatch::EnumOption(option)) => {
+                                let value = args.get(index + 1).ok_or_else(|| ParseError {
+                                    message: format!("missing value for option: -{short}"),
+                                })?;
+                                matches
+                                    .enum_options
+                                    .push((option.name().to_owned(), value.to_owned()));
+                                index += 2;
+                                continue;
+                            }
+                            None => {
+                                if let Some(child) = self.resolve_default_child()? {
+                                    match probe_short(child, short)? {
+                                        Some(OptionArity::Flag) => {
+                                            child_tokens.push(arg.to_owned());
+                                            index += 1;
+                                            continue;
+                                        }
+                                        Some(OptionArity::Value) => {
+                                            child_tokens.push(arg.to_owned());
+                                            if let Some(value) = args.get(index + 1) {
+                                                child_tokens.push(value.clone());
+                                                index += 2;
+                                            } else {
+                                                index += 1;
+                                            }
+                                            continue;
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -854,66 +1120,21 @@ impl Command {
                     });
                 }
 
-                if rest.len() == 1 {
-                    let short = rest.chars().next().unwrap();
-                    let flag_candidates = self.flags_matching_short(short);
-                    let option_candidates = self.options_matching_short(short);
-                    let enum_candidates = self.enum_options_matching_short(short);
+                let candidates = self.subcommands_matching(arg);
 
-                    if flag_candidates.len() + option_candidates.len() + enum_candidates.len() > 1 {
-                        return Err(ParseError {
-                            message: format!("ambiguous option: -{short}"),
-                        });
-                    }
-
-                    if let Some(flag) = flag_candidates.first() {
-                        matches.set_flag(flag.name(), true);
-                        index += 1;
-                        continue;
-                    }
-
-                    if let Some(option) = option_candidates.first() {
-                        let value = args.get(index + 1).ok_or_else(|| ParseError {
-                            message: format!("missing value for option: -{short}"),
-                        })?;
-                        matches
-                            .options
-                            .push((option.name().to_owned(), value.to_owned()));
-                        index += 2;
-                        continue;
-                    }
-
-                    if let Some(option) = enum_candidates.first() {
-                        let value = args.get(index + 1).ok_or_else(|| ParseError {
-                            message: format!("missing value for option: -{short}"),
-                        })?;
-                        matches
-                            .enum_options
-                            .push((option.name().to_owned(), value.to_owned()));
-                        index += 2;
-                        continue;
-                    }
+                if candidates.len() > 1 {
+                    return Err(ParseError {
+                        message: format!("ambiguous command: {arg}"),
+                    });
                 }
 
-                return Err(ParseError {
-                    message: format!("unknown flag: -{rest}"),
-                });
-            }
-
-            let candidates = self.subcommands_matching(arg);
-
-            if candidates.len() > 1 {
-                return Err(ParseError {
-                    message: format!("ambiguous command: {arg}"),
-                });
-            }
-
-            if let Some(child) = candidates.first() {
-                self.finalize(&mut matches, positional)?;
-                let child_matches = child.parse_tokens(&args[index + 1..])?;
-                matches.subcommand = Some(child.name().to_owned());
-                matches.subcommand_matches = Some(Box::new(child_matches));
-                return Ok(matches);
+                if let Some(child) = candidates.first() {
+                    self.finalize(&mut matches, positional)?;
+                    let child_matches = child.parse_tokens(&args[index + 1..])?;
+                    matches.subcommand = Some(child.name().to_owned());
+                    matches.subcommand_matches = Some(Box::new(child_matches));
+                    return Ok(matches);
+                }
             }
 
             if let Some(argument) = self.arguments.get(positional) {
@@ -921,6 +1142,21 @@ impl Command {
                     .arguments
                     .push((argument.name().to_owned(), arg.to_owned()));
                 positional += 1;
+                index += 1;
+                continue;
+            }
+
+            // A bare token neither self nor an explicit child claims falls
+            // through to the default child, whatever its own positional
+            // capacity (or further default chain) turns out to be — the
+            // child's own `parse_tokens` call is the one that decides
+            // whether it fits or is itself excess.
+            if self.resolve_default_child()?.is_some() {
+                if terminated && !child_terminator_sent {
+                    child_tokens.push("--".to_owned());
+                    child_terminator_sent = true;
+                }
+                child_tokens.push(arg.to_owned());
                 index += 1;
                 continue;
             }
@@ -938,20 +1174,12 @@ impl Command {
 
         self.finalize(&mut matches, positional)?;
 
-        if let Some(default_name) = &self.default_subcommand {
-            let candidates = self.subcommands_matching(default_name);
+        if self.default_subcommand.is_some() {
+            let child = self
+                .resolve_default_child()?
+                .expect("resolve_default_child returns Some or errors when configured");
 
-            if candidates.len() > 1 {
-                return Err(ParseError {
-                    message: format!("ambiguous command: {default_name}"),
-                });
-            }
-
-            let child = candidates.first().ok_or_else(|| ParseError {
-                message: format!("default subcommand not found: {default_name}"),
-            })?;
-
-            let child_matches = child.parse_tokens(&[])?;
+            let child_matches = child.parse_tokens(&child_tokens)?;
             matches.subcommand = Some(child.name().to_owned());
             matches.subcommand_matches = Some(Box::new(child_matches));
         }
@@ -3217,14 +3445,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_parent_option_is_not_forwarded_to_default_subcommand() {
+    fn option_owned_by_default_subcommand_is_forwarded_to_it() {
         let command = Command::new("root")
             .default_subcommand("build")
             .command(Command::new("build").option(StringOption::new("target")));
 
-        let error = command.parse_from(["--target", "wasm"]).unwrap_err();
+        let matches = command.parse_from(["--target", "wasm"]).unwrap();
 
-        assert_eq!(error.message(), "unknown flag: --target");
+        assert_eq!(matches.subcommand(), Some("build"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("target"),
+            Some("wasm")
+        );
     }
 
     #[test]
@@ -3240,6 +3472,374 @@ mod tests {
         assert_eq!(
             matches.subcommand_matches().unwrap().option("target"),
             Some("wasm")
+        );
+    }
+
+    // -- Default-subcommand input: options, flags, positionals --
+
+    #[test]
+    fn default_subcommand_receives_canonical_long_string_option() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format")));
+
+        let matches = command.parse_from(["--format", "json"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("run"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_receives_short_string_option_alias() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format").alias("f")));
+
+        let matches = command.parse_from(["-f", "json"]).unwrap();
+
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_receives_name_equals_value() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format")));
+
+        let matches = command.parse_from(["--format=json"]).unwrap();
+
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_receives_enum_option() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").enum_option(EnumOption::new("level", ["debug", "info"])));
+
+        let matches = command.parse_from(["--level", "debug"]).unwrap();
+
+        assert_eq!(
+            matches.subcommand_matches().unwrap().enum_option("level"),
+            Some("debug")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_receives_boolean_flag() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").flag(Flag::new("verbose")));
+
+        let matches = command.parse_from(["--verbose"]).unwrap();
+
+        assert!(matches.subcommand_matches().unwrap().flag("verbose"));
+    }
+
+    #[test]
+    fn default_subcommand_receives_positional() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").arg(Arg::new("file")));
+
+        let matches = command.parse_from(["main.rs"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("run"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().argument("file"),
+            Some("main.rs")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_required_positional_satisfied_from_argv() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").arg(Arg::new("file").required()));
+
+        let matches = command.parse_from(["main.rs"]).unwrap();
+
+        assert_eq!(
+            matches.subcommand_matches().unwrap().argument("file"),
+            Some("main.rs")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_required_option_satisfied_from_argv() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format").required()));
+
+        let matches = command.parse_from(["--format", "json"]).unwrap();
+
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn default_subcommand_defaults_still_apply_alongside_argv() {
+        let command = Command::new("root").default_subcommand("run").command(
+            Command::new("run")
+                .option(StringOption::new("format"))
+                .option(StringOption::new("target").default("native")),
+        );
+
+        let matches = command.parse_from(["--format", "json"]).unwrap();
+
+        let child = matches.subcommand_matches().unwrap();
+        assert_eq!(child.option("format"), Some("json"));
+        assert_eq!(child.option("target"), Some("native"));
+    }
+
+    #[test]
+    fn parent_option_and_default_subcommand_option_coexist() {
+        let command = Command::new("root")
+            .option(StringOption::new("profile"))
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format")));
+
+        let matches = command
+            .parse_from(["--profile", "release", "--format", "json"])
+            .unwrap();
+
+        assert_eq!(matches.option("profile"), Some("release"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn parent_flag_and_default_subcommand_option_coexist() {
+        let command = Command::new("root")
+            .flag(Flag::new("quiet"))
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format")));
+
+        let matches = command.parse_from(["--quiet", "--format", "json"]).unwrap();
+
+        assert!(matches.flag("quiet"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn option_owned_by_neither_parent_nor_default_subcommand_errors() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format")));
+
+        let error = command.parse_from(["--bogus", "x"]).unwrap_err();
+
+        assert_eq!(error.message(), "unknown flag: --bogus");
+    }
+
+    #[test]
+    fn nested_default_subcommand_chain_forwards_argv_at_every_level() {
+        let command = Command::new("root").default_subcommand("remote").command(
+            Command::new("remote")
+                .default_subcommand("status")
+                .command(Command::new("status").option(StringOption::new("format"))),
+        );
+
+        let matches = command.parse_from(["--format", "json"]).unwrap();
+
+        let remote_matches = matches.subcommand_matches().unwrap();
+        let status_matches = remote_matches.subcommand_matches().unwrap();
+        assert_eq!(status_matches.option("format"), Some("json"));
+    }
+
+    // -- `--` terminator --
+
+    #[test]
+    fn terminator_itself_is_not_stored_as_positional() {
+        let command = Command::new("root").arg(Arg::new("name"));
+
+        let matches = command.parse_from(["--", "value"]).unwrap();
+
+        assert_eq!(matches.argument("name"), Some("value"));
+    }
+
+    #[test]
+    fn terminator_treats_long_flag_spelling_literally() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose"))
+            .arg(Arg::new("value"));
+
+        let matches = command.parse_from(["--", "--verbose"]).unwrap();
+
+        assert!(!matches.flag("verbose"));
+        assert_eq!(matches.argument("value"), Some("--verbose"));
+    }
+
+    #[test]
+    fn terminator_treats_short_flag_spelling_literally() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose").short('x'))
+            .arg(Arg::new("value"));
+
+        let matches = command.parse_from(["--", "-x"]).unwrap();
+
+        assert!(!matches.flag("verbose"));
+        assert_eq!(matches.argument("value"), Some("-x"));
+    }
+
+    #[test]
+    fn terminator_treats_name_equals_value_literally() {
+        let command = Command::new("root")
+            .option(StringOption::new("name"))
+            .arg(Arg::new("value"));
+
+        let matches = command.parse_from(["--", "--name=value"]).unwrap();
+
+        assert_eq!(matches.option("name"), None);
+        assert_eq!(matches.argument("value"), Some("--name=value"));
+    }
+
+    #[test]
+    fn terminator_does_not_negate_flag_via_no_prefix() {
+        let command = Command::new("root")
+            .flag(Flag::new("verbose").default(true))
+            .arg(Arg::new("value"));
+
+        let matches = command.parse_from(["--", "--no-verbose"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+        assert_eq!(matches.argument("value"), Some("--no-verbose"));
+    }
+
+    #[test]
+    fn terminator_prevents_child_name_spelling_from_selecting_subcommand() {
+        let command = Command::new("root")
+            .arg(Arg::new("value"))
+            .command(Command::new("build"));
+
+        let matches = command.parse_from(["--", "build"]).unwrap();
+
+        assert_eq!(matches.subcommand(), None);
+        assert_eq!(matches.argument("value"), Some("build"));
+    }
+
+    #[test]
+    fn explicit_child_followed_by_its_own_terminator_works() {
+        let command = Command::new("root").command(
+            Command::new("build")
+                .flag(Flag::new("release"))
+                .arg(Arg::new("value")),
+        );
+
+        let matches = command.parse_from(["build", "--", "--release"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+        let child = matches.subcommand_matches().unwrap();
+        assert!(!child.flag("release"));
+        assert_eq!(child.argument("value"), Some("--release"));
+    }
+
+    #[test]
+    fn positionals_before_and_after_terminator_bind_in_declaration_order() {
+        let command = Command::new("root")
+            .arg(Arg::new("first"))
+            .arg(Arg::new("second"));
+
+        let matches = command.parse_from(["one", "--", "two"]).unwrap();
+
+        assert_eq!(matches.argument("first"), Some("one"));
+        assert_eq!(matches.argument("second"), Some("two"));
+    }
+
+    #[test]
+    fn excess_positional_after_terminator_errors() {
+        let command = Command::new("root").arg(Arg::new("only"));
+
+        let error = command.parse_from(["--", "one", "two"]).unwrap_err();
+
+        assert_eq!(error.message(), "unexpected argument: two");
+    }
+
+    #[test]
+    fn terminator_forwards_literal_positional_to_default_subcommand() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").arg(Arg::new("file")));
+
+        let matches = command.parse_from(["--", "--verbose"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("run"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().argument("file"),
+            Some("--verbose")
+        );
+    }
+
+    #[test]
+    fn terminator_before_explicit_child_argv_is_forwarded_intact() {
+        let command = Command::new("root").command(
+            Command::new("build")
+                .flag(Flag::new("release"))
+                .arg(Arg::new("value")),
+        );
+
+        let matches = command.parse_from(["build", "--", "--release"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+        let child = matches.subcommand_matches().unwrap();
+        assert_eq!(child.argument("value"), Some("--release"));
+    }
+
+    // -- Existing error parity --
+
+    #[test]
+    fn unexpected_positional_errors_when_no_subcommands_declared() {
+        let command = Command::new("root").arg(Arg::new("only"));
+
+        let error = command.parse_from(["one", "two"]).unwrap_err();
+
+        assert_eq!(error.message(), "unexpected argument: two");
+    }
+
+    #[test]
+    fn excess_positional_beyond_default_subcommand_capacity_errors() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").arg(Arg::new("file")));
+
+        let error = command.parse_from(["a.rs", "b.rs"]).unwrap_err();
+
+        assert_eq!(error.message(), "unexpected argument: b.rs");
+    }
+
+    #[test]
+    fn terminator_before_default_subcommand_selection_still_forwards_ambiguous_spelling() {
+        // Root has no explicit child; "build" only exists as the default
+        // child's own name. A leading `--` still must not turn "build" into
+        // subcommand recognition — it becomes a literal positional handed to
+        // the default child, exactly as when no terminator is present, since
+        // the default child was always going to be selected regardless.
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").arg(Arg::new("target")));
+
+        let matches = command.parse_from(["--", "build"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("run"));
+        assert_eq!(
+            matches.subcommand_matches().unwrap().argument("target"),
+            Some("build")
         );
     }
 }
