@@ -51,6 +51,32 @@ impl Flag {
     }
 }
 
+/// Parsed command-line matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Matches {
+    flags: Vec<String>,
+}
+
+impl Matches {
+    /// Returns whether a flag was present.
+    pub fn flag(&self, name: &str) -> bool {
+        self.flags.iter().any(|flag| flag == name)
+    }
+}
+
+/// An error produced while parsing command-line input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    message: String,
+}
+
+impl ParseError {
+    /// Returns the parse error message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// A command in a Ritty CLI application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -120,6 +146,32 @@ impl Command {
         &self.flags
     }
 
+    /// Parses command-line arguments.
+    pub fn parse_from<I, S>(&self, args: I) -> Result<Matches, ParseError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut matches = Matches { flags: Vec::new() };
+
+        for arg in args {
+            let arg = arg.as_ref();
+
+            if let Some(name) = arg.strip_prefix("--") {
+                if self.flags.iter().any(|flag| flag.name() == name) {
+                    matches.flags.push(name.to_owned());
+                    continue;
+                }
+
+                return Err(ParseError {
+                    message: format!("unknown flag: --{name}"),
+                });
+            }
+        }
+
+        Ok(matches)
+    }
+
     /// Returns the command name.
     pub fn name(&self) -> &str {
         &self.name
@@ -186,5 +238,14 @@ mod tests {
         assert_eq!(command.flags().len(), 1);
         assert_eq!(command.flags()[0].name(), "verbose");
         assert_eq!(command.flags()[0].short_name(), Some('v'));
+    }
+
+    #[test]
+    fn parses_long_flag() {
+        let command = Command::new("ritty").flag(Flag::new("verbose"));
+
+        let matches = command.parse_from(["--verbose"]).unwrap();
+
+        assert!(matches.flag("verbose"));
     }
 }
