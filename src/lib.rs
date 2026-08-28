@@ -56,6 +56,7 @@ impl Flag {
 pub struct Matches {
     flags: Vec<String>,
     arguments: Vec<(String, String)>,
+    subcommand: Option<String>,
 }
 
 impl Matches {
@@ -70,6 +71,11 @@ impl Matches {
             .iter()
             .find(|(argument, _)| argument == name)
             .map(|(_, value)| value.as_str())
+    }
+
+    /// Returns the selected subcommand.
+    pub fn subcommand(&self) -> Option<&str> {
+        self.subcommand.as_deref()
     }
 }
 
@@ -164,6 +170,7 @@ impl Command {
         let mut matches = Matches {
             flags: Vec::new(),
             arguments: Vec::new(),
+            subcommand: None,
         };
         let mut positional = 0;
 
@@ -198,6 +205,11 @@ impl Command {
                 return Err(ParseError {
                     message: format!("unknown flag: -{short}"),
                 });
+            }
+
+            if self.subcommands.iter().any(|command| command.name() == arg) {
+                matches.subcommand = Some(arg.to_owned());
+                continue;
             }
 
             if let Some(argument) = self.arguments.get(positional) {
@@ -309,5 +321,14 @@ mod tests {
         let matches = command.parse_from(["world"]).unwrap();
 
         assert_eq!(matches.argument("name"), Some("world"));
+    }
+
+    #[test]
+    fn parses_subcommand() {
+        let command = Command::new("ritty").command(Command::new("build"));
+
+        let matches = command.parse_from(["build"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
     }
 }
