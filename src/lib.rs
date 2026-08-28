@@ -590,12 +590,25 @@ fn dedup_chars(items: Vec<char>) -> Vec<char> {
         .collect()
 }
 
+/// Extracts `value` as a single Unicode scalar, the definition of "one
+/// short-option character" shared by the parser and usage renderer.
+/// `None` for an empty string or one with more than one scalar — in
+/// particular, a multi-byte UTF-8 encoding of a single `char` still counts
+/// as one.
+fn single_char(value: &str) -> Option<char> {
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 /// Single-character aliases, which the parser also accepts as short options.
 fn short_aliases(aliases: &[String]) -> Vec<char> {
     aliases
         .iter()
-        .filter(|a| a.chars().count() == 1)
-        .filter_map(|a| a.chars().next())
+        .filter_map(|a| single_char(a.as_str()))
         .collect()
 }
 
@@ -1015,7 +1028,7 @@ impl Command {
                 option
                     .aliases()
                     .iter()
-                    .any(|alias| alias.len() == 1 && alias.starts_with(short))
+                    .any(|alias| single_char(alias) == Some(short))
             })
             .collect()
     }
@@ -1036,7 +1049,7 @@ impl Command {
                 option
                     .aliases()
                     .iter()
-                    .any(|alias| alias.len() == 1 && alias.starts_with(short))
+                    .any(|alias| single_char(alias) == Some(short))
             })
             .collect()
     }
@@ -1059,7 +1072,7 @@ impl Command {
                     || flag
                         .aliases()
                         .iter()
-                        .any(|alias| alias.len() == 1 && alias.starts_with(short))
+                        .any(|alias| single_char(alias) == Some(short))
             })
             .collect()
     }
@@ -1348,8 +1361,7 @@ impl Command {
 
                 if let Some(rest) = arg.strip_prefix('-') {
                     if let Some((name, value)) = rest.split_once('=') {
-                        if name.len() == 1 {
-                            let short = name.chars().next().unwrap();
+                        if let Some(short) = single_char(name) {
                             let (string_match, enum_match) = self.short_equals_candidates(short)?;
 
                             if let Some(option) = string_match {
@@ -1382,9 +1394,7 @@ impl Command {
                         });
                     }
 
-                    if rest.len() == 1 {
-                        let short = rest.chars().next().unwrap();
-
+                    if let Some(short) = single_char(rest) {
                         match self.resolve_short(short)? {
                             Some(ShortMatch::Flag(flag)) => {
                                 matches.set_flag(flag.name(), true);
@@ -2242,6 +2252,25 @@ mod tests {
     }
 
     #[test]
+    fn unicode_scalar_string_option_alias_works_separate_and_equals() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("é"));
+
+        let separate = command.parse_from(["-é", "dist"]).unwrap();
+        let equals = command.parse_from(["-é=dist"]).unwrap();
+
+        assert_eq!(separate.option("output"), Some("dist"));
+        assert_eq!(equals.option("output"), Some("dist"));
+    }
+
+    #[test]
+    fn multi_scalar_unicode_string_option_alias_is_not_a_short_option() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("日本"));
+
+        assert!(command.parse_from(["-日", "dist"]).is_err());
+        assert!(command.parse_from(["-日=dist"]).is_err());
+    }
+
+    #[test]
     fn short_string_option_alias_equals_value_preserves_extra_equals() {
         let command = Command::new("ritty").option(StringOption::new("output").alias("o"));
 
@@ -2496,6 +2525,43 @@ mod tests {
 
         assert!(short.flag("verbose"));
         assert!(long.flag("verbose"));
+    }
+
+    #[test]
+    fn dedicated_short_accepts_multi_byte_unicode_scalar() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('é'));
+
+        let matches = command.parse_from(["-é"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+    }
+
+    #[test]
+    fn dedicated_short_multi_byte_unicode_matches_usage_spelling() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('é'));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -é, --verbose"
+        );
+    }
+
+    #[test]
+    fn unicode_scalar_flag_alias_works_as_short() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").alias("é"));
+
+        let matches = command.parse_from(["-é"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+    }
+
+    #[test]
+    fn multi_scalar_unicode_alias_is_not_a_short_option() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").alias("日本"));
+
+        let result = command.parse_from(["-日"]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2976,6 +3042,31 @@ mod tests {
 
         assert_eq!(separate.enum_option("level"), Some("info"));
         assert_eq!(equals.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn unicode_scalar_enum_option_alias_works_separate_and_equals() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).alias("é"));
+
+        let separate = command.parse_from(["-é", "info"]).unwrap();
+        let equals = command.parse_from(["-é=info"]).unwrap();
+
+        assert_eq!(separate.enum_option("level"), Some("info"));
+        assert_eq!(equals.enum_option("level"), Some("info"));
+    }
+
+    #[test]
+    fn unicode_scalar_enum_option_alias_still_validates_value() {
+        let command = Command::new("ritty")
+            .enum_option(EnumOption::new("level", ["debug", "info"]).alias("é"));
+
+        let error = command.parse_from(["-é", "verbose"]).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            "invalid value for option: --level: verbose (expected one of: debug, info)"
+        );
     }
 
     #[test]
@@ -3886,6 +3977,25 @@ mod tests {
     }
 
     #[test]
+    fn default_subcommand_receives_unicode_scalar_short_alias() {
+        let command = Command::new("root")
+            .default_subcommand("run")
+            .command(Command::new("run").option(StringOption::new("format").alias("é")));
+
+        let separate = command.parse_from(["-é", "json"]).unwrap();
+        let equals = command.parse_from(["-é=json"]).unwrap();
+
+        assert_eq!(
+            separate.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+        assert_eq!(
+            equals.subcommand_matches().unwrap().option("format"),
+            Some("json")
+        );
+    }
+
+    #[test]
     fn default_subcommand_receives_name_equals_value() {
         let command = Command::new("root")
             .default_subcommand("run")
@@ -4375,6 +4485,20 @@ mod tests {
         assert_eq!(
             command.render_usage(),
             "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -o, --output=<output>"
+        );
+    }
+
+    #[test]
+    fn usage_unicode_scalar_string_alias_matches_parser_spelling() {
+        let command = Command::new("ritty").option(StringOption::new("output").alias("é"));
+
+        assert_eq!(
+            command.render_usage(),
+            "USAGE ritty [OPTIONS]\n\nOPTIONS\n\n  -é, --output=<output>"
+        );
+        assert_eq!(
+            command.parse_from(["-é", "dist"]).unwrap().option("output"),
+            Some("dist")
         );
     }
 
