@@ -5,6 +5,7 @@
 pub struct Arg {
     name: String,
     required: bool,
+    default: Option<String>,
 }
 
 impl Arg {
@@ -13,12 +14,19 @@ impl Arg {
         Self {
             name: name.into(),
             required: false,
+            default: None,
         }
     }
 
     /// Marks the argument as required.
     pub fn required(mut self) -> Self {
         self.required = true;
+        self
+    }
+
+    /// Sets the default value used when the argument is not supplied.
+    pub fn default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
         self
     }
 
@@ -30,6 +38,11 @@ impl Arg {
     /// Returns the argument name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the argument's default value, if any.
+    pub fn default_value(&self) -> Option<&str> {
+        self.default.as_deref()
     }
 }
 
@@ -240,15 +253,18 @@ impl Command {
             });
         }
 
-        if let Some(argument) = self
-            .arguments
-            .iter()
-            .skip(positional)
-            .find(|argument| argument.is_required())
-        {
-            return Err(ParseError {
-                message: format!("missing required argument: {}", argument.name()),
-            });
+        for argument in self.arguments.iter().skip(positional) {
+            match argument.default_value() {
+                Some(default) => matches
+                    .arguments
+                    .push((argument.name().to_owned(), default.to_owned())),
+                None if argument.is_required() => {
+                    return Err(ParseError {
+                        message: format!("missing required argument: {}", argument.name()),
+                    });
+                }
+                None => {}
+            }
         }
 
         Ok(matches)
@@ -410,6 +426,81 @@ mod tests {
         let error = command.parse_from(["build"]).unwrap_err();
 
         assert_eq!(error.message(), "missing required argument: name");
+    }
+
+    #[test]
+    fn missing_optional_positional_uses_default() {
+        let command = Command::new("ritty").arg(Arg::new("name").default("world"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.argument("name"), Some("world"));
+    }
+
+    #[test]
+    fn explicit_input_overrides_default() {
+        let command = Command::new("ritty").arg(Arg::new("name").default("world"));
+
+        let matches = command.parse_from(["alice"]).unwrap();
+
+        assert_eq!(matches.argument("name"), Some("alice"));
+    }
+
+    #[test]
+    fn multiple_defaults_apply_independently() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("first").default("a"))
+            .arg(Arg::new("second").default("b"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.argument("first"), Some("a"));
+        assert_eq!(matches.argument("second"), Some("b"));
+    }
+
+    #[test]
+    fn mixed_explicit_and_default_values_bind_in_order() {
+        let command = Command::new("ritty")
+            .arg(Arg::new("first").default("a"))
+            .arg(Arg::new("second").default("b"));
+
+        let matches = command.parse_from(["x"]).unwrap();
+
+        assert_eq!(matches.argument("first"), Some("x"));
+        assert_eq!(matches.argument("second"), Some("b"));
+    }
+
+    #[test]
+    fn required_argument_with_default_is_satisfied_when_omitted() {
+        let command = Command::new("ritty").arg(Arg::new("name").required().default("world"));
+
+        let matches = command.parse_from([] as [&str; 0]).unwrap();
+
+        assert_eq!(matches.argument("name"), Some("world"));
+    }
+
+    #[test]
+    fn flag_does_not_suppress_positional_default() {
+        let command = Command::new("ritty")
+            .flag(Flag::new("verbose"))
+            .arg(Arg::new("name").default("world"));
+
+        let matches = command.parse_from(["--verbose"]).unwrap();
+
+        assert!(matches.flag("verbose"));
+        assert_eq!(matches.argument("name"), Some("world"));
+    }
+
+    #[test]
+    fn subcommand_does_not_suppress_positional_default() {
+        let command = Command::new("ritty")
+            .command(Command::new("build"))
+            .arg(Arg::new("name").default("world"));
+
+        let matches = command.parse_from(["build"]).unwrap();
+
+        assert_eq!(matches.subcommand(), Some("build"));
+        assert_eq!(matches.argument("name"), Some("world"));
     }
 
     #[test]
