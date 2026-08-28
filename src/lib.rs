@@ -18,6 +18,39 @@ impl Arg {
     }
 }
 
+/// A boolean flag in a Ritty command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flag {
+    name: String,
+    short: Option<char>,
+}
+
+impl Flag {
+    /// Creates a new flag.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            short: None,
+        }
+    }
+
+    /// Sets the short flag name.
+    pub fn short(mut self, short: char) -> Self {
+        self.short = Some(short);
+        self
+    }
+
+    /// Returns the flag name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the short flag name.
+    pub fn short_name(&self) -> Option<char> {
+        self.short
+    }
+}
+
 /// A command in a Ritty CLI application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -26,6 +59,7 @@ pub struct Command {
     version: Option<String>,
     subcommands: Vec<Command>,
     arguments: Vec<Arg>,
+    flags: Vec<Flag>,
 }
 
 impl Command {
@@ -37,6 +71,7 @@ impl Command {
             version: None,
             subcommands: Vec::new(),
             arguments: Vec::new(),
+            flags: Vec::new(),
         }
     }
 
@@ -72,6 +107,17 @@ impl Command {
     /// Returns the command's positional arguments.
     pub fn arguments(&self) -> &[Arg] {
         &self.arguments
+    }
+
+    /// Adds a flag.
+    pub fn flag(mut self, flag: Flag) -> Self {
+        self.flags.push(flag);
+        self
+    }
+
+    /// Returns the command's flags.
+    pub fn flags(&self) -> &[Flag] {
+        &self.flags
     }
 
     /// Returns the command name.
@@ -131,5 +177,14 @@ mod tests {
 
         assert_eq!(command.arguments().len(), 1);
         assert_eq!(command.arguments()[0].name(), "name");
+    }
+
+    #[test]
+    fn adds_flag() {
+        let command = Command::new("ritty").flag(Flag::new("verbose").short('v'));
+
+        assert_eq!(command.flags().len(), 1);
+        assert_eq!(command.flags()[0].name(), "verbose");
+        assert_eq!(command.flags()[0].short_name(), Some('v'));
     }
 }
